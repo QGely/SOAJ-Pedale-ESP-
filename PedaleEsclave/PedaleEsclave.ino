@@ -12,17 +12,20 @@
  *    - Sort le signal traité sur le DAC interne (GPIO25), centré sur 128.
  *
  *  Chaîne de traitement (dans l'ordre) :
- *    1.  Lecture ADC 12 bits sur GPIO34.
+ *    1.  Lecture ADC 12 bits sur GPIO34 — MÉDIANE DE 3 LECTURES : élimine
+ *        les parasites impulsionnels (pics ADC dus au WiFi actif).
  *    2.  Suivi et suppression de l'offset DC (moyenne glissante lente).
  *    3.  Filtre passe-haut ~40 Hz (retire résidu DC et basses parasites).
- *    4.  Filtre passe-bas ~5 kHz AVANT saturation (réduit le bruit ADC).
- *    5.  Noise gate PROGRESSIF (suiveur d'enveloppe + gain lissé :
- *        pas de coupure brutale, silence total sans guitare).
+ *    4.  Filtre passe-bas ~4 kHz AVANT saturation (réduit le souffle ADC
+ *        avant le gros gain ; les harmoniques sont recréées par la disto).
+ *    5.  Noise gate PROGRESSIF (suiveur d'enveloppe + gain lissé), seuils
+ *        qui MONTENT AVEC LE DRIVE (comme le gate d'un ampli high-gain).
  *    6.  Étage de saturation = émulation du circuit ADTL082 (schéma LTspice) :
- *        gain x51..x501 (pot DRIVE R5+R6), shelf C5/R7 (graves non amplifiés),
- *        passe-bas C4 en contre-réaction.
+ *        pot DRIVE exponentiel x2 (clean) -> x500 (heavy metal),
+ *        shelf C5/R7 (graves non amplifiés), passe-bas C4 en contre-réaction.
  *    7.  Écrêtage aux rails ±12 V (tanh) PUIS diodes d'écrêtage (paramètre D :
- *        silicium ±0,6 V, LED ±1,7 V, germanium ±0,3 V) : crêtes aplaties.
+ *        silicium ±0,6 V, LED ±1,7 V, germanium ±0,3 V). Le paramètre C règle
+ *        la DURETÉ du genou : 0.95 = doux/rond, 0.5 = dur/agressif.
  *    8.  Tone = pot R8+R9 + C7 : passe-bas variable APRÈS saturation.
  *    9.  Lissage de TOUS les paramètres reçus (pas de craquement).
  *    10. Volume (pot R10+R11) x amplitude DAC maximale OUTPUT_LEVEL.
@@ -75,16 +78,19 @@
 // Ampli op non-inverseur qui sature sur ses rails ±12 V :
 //   R7 1 kΩ + C5 220 nF (jambe de gain)  -> le plein gain ne s'applique
 //     qu'au-dessus de ~723 Hz : graves propres, médiums/aigus boostés.
-//   R6 50 kΩ + R5 450 kΩ (potentiomètre DRIVE = paramètre G, 0..1)
-//     -> gain x51 (G=0, quasi clean) à x501 (G=1, fuzz).
-//   C4 100 pF en contre-réaction -> passe-bas 3,2 à 32 kHz selon le drive.
+//   Potentiomètre DRIVE = paramètre G (0..1). La course est EXPONENTIELLE
+//     (comme un pot audio "log") : x2 (G=0, son quasi clean) -> x30 (G=0.5,
+//     crunch) -> x500 (G=1, heavy metal). L'ancienne course linéaire
+//     x51..x501 saturait déjà à fond au minimum : le bouton ne servait à rien.
+//   C4 100 pF en contre-réaction -> passe-bas qui s'abaisse quand le drive
+//     monte (3,2 kHz à drive max) : adoucit le grésillement aigu.
 //   Écrêtage aux rails ±12 V -> crêtes aplaties (la vraie saturation).
 // En unités normalisées (±1 = ±1,65 V côté ADC), les rails valent ±7,27.
 #define AMP_R7_OHMS         1000.0f
-#define AMP_R6_OHMS         50e3f
-#define AMP_R5_OHMS         450e3f
 #define AMP_SHELF_HZ        723.0f     // zéro posé par C5/R7
 #define AMP_C4_FARADS       100e-12f
+#define DRIVE_GAIN_MIN      2.0f       // gain à G=0 : presque clean
+#define DRIVE_GAIN_MAX      500.0f     // gain à G=1 : heavy metal
 #define RAIL_NORM           7.27f      // ±12 V exprimés en unités ADC (±1,65 V)
 #define BYPASS_GAIN         8.0f       // rattrapage de niveau quand l'effet est coupé
 
@@ -97,6 +103,10 @@
 #define VDIODE_SILICIUM     0.364f     // 2 x 1N4148, ±0,6 V  -> saturation forte
 #define VDIODE_LED          1.030f     // 2 x LED,    ±1,7 V  -> crunch plus ouvert
 #define VDIODE_GERMANIUM    0.182f     // 2 x germanium, ±0,3 V -> fuzz compressé
+// Le paramètre C règle la DURETÉ du genou d'écrêtage : C=0.95 -> genou doux
+// et rond (tanh), C=0.5 -> genou dur, presque carré (plus d'harmoniques,
+// son plus agressif). KNEE_RANGE = pente maximale ajoutée au genou.
+#define KNEE_RANGE          5.0f
 
 // --- Tone : potentiomètre R8+R9 (10 kΩ) + C7 (22 nF) -----------------------
 // Passe-bas variable : T=1 -> brillant (~14 kHz), T=0.5 -> ~1,4 kHz (comme le
@@ -114,28 +124,37 @@
 
 // Vu-mètre de diagnostic : 1 = affiche chaque seconde l'état de la chaîne
 // (crête d'entrée, enveloppe, gate, crête DAC) sur le port série.
-// L'affichage bloque l'audio ~5 ms par seconde : mettre 0 pour jouer proprement.
-#define DEBUG_METER         1
+// ATTENTION : chaque affichage bloque l'audio ~10 ms -> un craquement par
+// seconde. Laisser à 0 pour JOUER ; mettre à 1 seulement pour DIAGNOSTIQUER.
+#define DEBUG_METER         0
 
 // Bornes de sécurité des paramètres (identiques côté maître)
 // G, T et V sont maintenant des POSITIONS DE POTENTIOMÈTRE, de 0.0 à 1.0 :
 //   G = drive (R5+R6), T = tone (R8+R9), V = volume (R10+R11)
 #define GAIN_MIN            0.0f
 #define GAIN_MAX            1.0f
-#define CLIP_MIN            0.50f     // C réduit virtuellement les rails ±12 V
-#define CLIP_MAX            0.95f
+#define CLIP_MIN            0.50f     // C = dureté du genou (0.5 = dur/agressif)
+#define CLIP_MAX            0.95f     //     (0.95 = doux/rond)
 #define VOLUME_MAX          1.0f
 
 // Filtres fixes
 #define HPF_FREQ_HZ         40.0f     // passe-haut d'entrée (garde le mi grave 82 Hz)
-#define LPF_PRE_FREQ_HZ     5000.0f   // passe-bas avant saturation
+#define LPF_PRE_FREQ_HZ     4000.0f   // passe-bas avant saturation (anti-souffle :
+                                      // le souffle amplifié x500 était le
+                                      // "gros grésillement" — on coupe avant)
 
 // Noise gate — placé AVANT le gros gain, sinon le souffle serait amplifié x500.
 // Amplitudes normalisées (pleine échelle ADC = 1.0). Une guitare directe fait
 // ~0.06 en crête, le bruit ADC ~0.001.
+// Les seuils MONTENT AVEC LE DRIVE (x1 à drive 0, x4 à drive max) : plus on
+// amplifie, plus il faut fermer tôt — c'est le réglage des amplis high-gain.
 #define GATE_LOW            0.003f    // en dessous : fermé (silence)
 #define GATE_HIGH           0.009f    // au-dessus : complètement ouvert
-#define ENV_ATTACK          0.05f     // suiveur d'enveloppe : montée rapide
+#define GATE_DRIVE_SCALE    3.0f      // seuils x(1 + 3*G)
+#define ENV_ATTACK          0.01f     // suiveur d'enveloppe : montée ~2,5 ms.
+                                      // Volontairement pas plus rapide : un
+                                      // parasite d'UN échantillon ne doit pas
+                                      // pouvoir ouvrir le gate (anti-crachotis)
 #define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
 #define GATE_OPEN_COEF      0.010f    // ouverture du gate ~5 ms
 #define GATE_CLOSE_COEF     0.0008f   // fermeture douce ~60 ms (garde le sustain)
@@ -193,9 +212,10 @@ static float smEffect  = 1.0f;
 static float smVd      = VDIODE_SILICIUM;  // seuil de diode lissé (change sans "pop")
 
 // Coefficients calculés au setup()
-static float hpfA        = 0.0f;
-static float lpfPreAlpha = 0.0f;
-static float shelfA      = 0.0f;   // passe-haut 723 Hz du shelf de gain
+static float hpfA         = 0.0f;
+static float lpfPreAlpha  = 0.0f;
+static float shelfA       = 0.0f;  // passe-haut 723 Hz du shelf de gain
+static float driveLogSpan = 0.0f;  // ln(DRIVE_GAIN_MAX / DRIVE_GAIN_MIN)
 #define DT_SEC (1.0f / (float)SAMPLE_RATE_HZ)
 
 static uint32_t nextSampleUs = 0;
@@ -223,12 +243,26 @@ static float highpassA(float freqHz) {
   return rc / (rc + dt);
 }
 
-static inline int readGuitarAdc() {
+static inline int readAdcOnce() {
 #ifdef USE_LEGACY_ADC
   return adc1_get_raw(ADC1_CHANNEL_6);   // GPIO34
 #else
   return analogRead(PIN_GUITAR_IN);
 #endif
+}
+
+// Lecture guitare = MÉDIANE de 3 lectures ADC (~30 µs sur les 50 µs du cycle).
+// L'ADC de l'ESP32 crache des pics isolés de plusieurs dizaines de pas quand
+// le WiFi émet/reçoit : amplifiés x500 par l'étage de saturation, ces pics
+// étaient le "gros grésillement". La médiane les élimine sans adoucir le son
+// (contrairement à une moyenne, elle ignore totalement la valeur aberrante).
+static inline int readGuitarAdc() {
+  const int a = readAdcOnce();
+  const int b = readAdcOnce();
+  const int c = readAdcOnce();
+  const int lo = (a < b) ? a : b;
+  const int hi = (a > b) ? a : b;
+  return (c > hi) ? hi : ((c < lo) ? lo : c);   // médiane = c borné entre lo et hi
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +314,12 @@ static inline void meterTick(float raw) {
                     "(verifiez jack, condensateur C1 et pont diviseur)\n", mPeakIn);
     } else {
       Serial.printf("[Metre] entree: %.0f pas ADC | enveloppe: %.3f | gate: %s (%.2f) | "
-                    "sortie DAC: +/-%d pas | G=%.2f V=%.3f E=%.0f Vd=%.2f\n",
+                    "sortie DAC: +/-%d pas | G=%.2f (x%.0f) V=%.3f E=%.0f Vd=%.2f\n",
                     mPeakIn, envelope,
                     (gateGain > 0.5f) ? "OUVERT" : "ferme", gateGain,
-                    mPeakOut, smGain, smVolume, smEffect, smVd);
+                    mPeakOut, smGain,
+                    DRIVE_GAIN_MIN * expf(smGain * driveLogSpan),
+                    smVolume, smEffect, smVd);
     }
     mPeakIn  = 0.0f;
     mPeakOut = 0;
@@ -325,14 +361,18 @@ static inline void processSample() {
   lpPre += lpfPreAlpha * (hp - lpPre);
   float sig = lpPre;
 
-  // ---- 5. Noise gate progressif -----------------------------------------
+  // ---- 5. Noise gate progressif (seuils indexés sur le drive) -------------
   const float mag = fabsf(sig);
   envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE) * (mag - envelope);
 
+  const float gateScale = 1.0f + GATE_DRIVE_SCALE * smGain;
+  const float gLow  = GATE_LOW  * gateScale;
+  const float gHigh = GATE_HIGH * gateScale;
+
   float gateTarget;
-  if      (envelope <= GATE_LOW)  gateTarget = 0.0f;
-  else if (envelope >= GATE_HIGH) gateTarget = 1.0f;
-  else    gateTarget = (envelope - GATE_LOW) / (GATE_HIGH - GATE_LOW);
+  if      (envelope <= gLow)  gateTarget = 0.0f;
+  else if (envelope >= gHigh) gateTarget = 1.0f;
+  else    gateTarget = (envelope - gLow) / (gHigh - gLow);
 
   gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : GATE_CLOSE_COEF)
               * (gateTarget - gateGain);
@@ -346,19 +386,22 @@ static inline void processSample() {
     return;
   }
 
-  // ---- 6. Étage ADTL082 : gain x51..x501 avec shelf (C5/R7) ---------------
-  // Le pot DRIVE (G) fixe Rf = R6 + G*R5 ; gain haut-médium = 1 + Rf/R7.
+  // ---- 6. Étage ADTL082 : drive exponentiel x2 (clean) -> x500 (metal) -----
+  // Course logarithmique comme un vrai pot audio : chaque cran du bouton
+  // multiplie le gain par le même facteur. G=0 -> x2 (quasi clean),
+  // G=0.5 -> x30 (crunch), G=1 -> x500 (heavy metal).
   // Le réseau C5/R7 fait que seules les fréquences > ~723 Hz reçoivent le
   // plein gain : on l'émule en n'amplifiant que la partie passe-haut du signal.
-  const float rfOhms  = AMP_R6_OHMS + smGain * AMP_R5_OHMS;
-  const float ampGain = 1.0f + rfOhms / AMP_R7_OHMS;
+  const float ampGain = DRIVE_GAIN_MIN * expf(smGain * driveLogSpan);
+  const float rfOhms  = (ampGain - 1.0f) * AMP_R7_OHMS;   // Rf équivalent
 
   const float sh = shelfA * (shPrevY + sig - shPrevX);   // passe-haut 723 Hz
   shPrevX = sig;
   shPrevY = sh;
   float amp = sig + (ampGain - 1.0f) * sh;
 
-  // Passe-bas C4 en contre-réaction : 3,2 kHz (drive max) à 32 kHz (drive min)
+  // Passe-bas C4 en contre-réaction : descend vers 3,2 kHz à drive max
+  // (adoucit le grésillement aigu quand le gain est énorme)
   const float rc4 = rfOhms * AMP_C4_FARADS;
   lpC4 += (DT_SEC / (rc4 + DT_SEC)) * (amp - lpC4);
   amp = lpC4;
@@ -366,22 +409,23 @@ static inline void processSample() {
   // ---- 7a. Écrêtage aux rails ±12 V de l'ampli op --------------------------
   // tanh donne le même aplatissement qu'un ampli op poussé aux rails, sans
   // les harmoniques d'aliasing d'un écrêtage numérique dur.
-  float sat = RAIL_NORM * tanhf(amp / RAIL_NORM);
+  const float sat = RAIL_NORM * tanhf(amp / RAIL_NORM);
 
-  // ---- 7b. Diodes d'écrêtage (paramètre D) ---------------------------------
+  // ---- 7b. Diodes d'écrêtage (D) + dureté du genou (C) ---------------------
   // Le signal (jusqu'à ±12 V) vient s'écraser sur le seuil des diodes
   // (±0,6 V en silicium) : c'est là que se fait le gros de la saturation.
-  // Le paramètre C module le seuil effectif (plus bas = écrase plus tôt).
+  // C règle la DURETÉ : 0.95 = genou rond (tanh pur), 0.5 = genou serré
+  // presque carré -> nettement plus d'harmoniques, son plus agressif.
   // En mode D=0 le "seuil" est RAIL_NORM : on retrouve les rails seuls.
-  const float vdEff = smVd * smClip;
-  sat = vdEff * tanhf(sat / vdEff);
-  sat *= (1.0f / vdEff);              // renormalise : écrêtage plein -> ±1
-                                      // (le volume perçu ne dépend pas de D/C)
+  const float knee = 1.0f + KNEE_RANGE * (CLIP_MAX - smClip)
+                                       * (1.0f / (CLIP_MAX - CLIP_MIN));
+  const float clipped = tanhf(knee * sat / smVd);   // sortie normalisée ±1
+                                       // (le volume perçu ne dépend pas de D)
 
   // ---- 8. Tone : pot R8+R9 + C7, passe-bas variable après saturation ------
   const float rTone = TONE_R_MIN_OHMS + (1.0f - smTone) * (TONE_R_MAX_OHMS - TONE_R_MIN_OHMS);
   const float rcT   = rTone * TONE_C7_FARADS;
-  lpPost += (DT_SEC / (rcT + DT_SEC)) * (sat - lpPost);
+  lpPost += (DT_SEC / (rcT + DT_SEC)) * (clipped - lpPost);
 
   // ---- Bypass en fondu : mélange signal propre <-> signal saturé ----------
   // (le signal propre est remonté pour rester comparable au signal d'effet)
@@ -430,9 +474,10 @@ void setup() {
   dacWrite(PIN_AUDIO_OUT, 128);
 
   // --- Coefficients de filtres fixes ---
-  hpfA        = highpassA(HPF_FREQ_HZ);
-  lpfPreAlpha = lowpassAlpha(LPF_PRE_FREQ_HZ);
-  shelfA      = highpassA(AMP_SHELF_HZ);
+  hpfA         = highpassA(HPF_FREQ_HZ);
+  lpfPreAlpha  = lowpassAlpha(LPF_PRE_FREQ_HZ);
+  shelfA       = highpassA(AMP_SHELF_HZ);
+  driveLogSpan = logf(DRIVE_GAIN_MAX / DRIVE_GAIN_MIN);
 
   // --- WiFi / ESP-NOW (réception uniquement) ---
   WiFi.mode(WIFI_STA);

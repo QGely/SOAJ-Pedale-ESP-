@@ -61,8 +61,8 @@
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
-  float    gain;      // 0.0 .. 1.0  position du pot DRIVE (gain ampli x51..x501)
-  float    clip;      // 0.50 .. 0.95 seuil d'écrêtage effectif (module les diodes)
+  float    gain;      // 0.0 .. 1.0  pot DRIVE (exponentiel : x2 clean .. x500 metal)
+  float    clip;      // 0.50 .. 0.95 dureté de l'écrêtage (bas = dur/agressif)
   float    tone;      // 0.0 .. 1.0  position du pot TONE (0 = sombre, 1 = brillant)
   float    volume;    // 0.0 .. 1.0  position du pot VOLUME
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
@@ -157,10 +157,10 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 <div class="card">
   <div class="ctl"><div class="row"><label for="g">Drive</label><output id="og">0.50</output></div>
     <input type="range" id="g" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">pot R5+R6 &mdash; gain &times;51 &agrave; &times;501</div></div>
+    <div class="hint">&times;2 clean &rarr; &times;30 crunch &rarr; &times;500 heavy metal</div></div>
   <div class="ctl"><div class="row"><label for="c">Clip</label><output id="oc">0.85</output></div>
     <input type="range" id="c" min="0.5" max="0.95" step="0.01" value="0.85">
-    <div class="hint">seuil d'&eacute;cr&ecirc;tage &mdash; plus bas = &eacute;crase plus t&ocirc;t</div></div>
+    <div class="hint">duret&eacute; de l'&eacute;cr&ecirc;tage &mdash; plus bas = plus dur / agressif</div></div>
   <div class="ctl"><div class="row"><label for="t">Tone</label><output id="ot">0.50</output></div>
     <input type="range" id="t" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">pot R8+R9 &mdash; 0 = sombre, 1 = brillant</div></div>
