@@ -100,9 +100,11 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
 8. **Passe-bas de tonalité après saturation** (700 Hz – 4,5 kHz selon `tone`).
 9. **Lissage de tous les paramètres** (~60 ms) : aucun craquement quand on change une
    valeur ou qu'on active/désactive l'effet (le bypass est un fondu enchaîné).
-10. **Volume très réduit** (plafond logiciel 0,25) × facteur global `OUTPUT_LEVEL` (0,15).
+10. **Volume plafonné** (0,25 max, normalisé) × amplitude DAC maximale `OUTPUT_LEVEL`.
+    Au volume par défaut (0,12), la sortie fait ~±27 pas de DAC (~±0,35 V) : audible
+    mais modéré — le niveau final se règle sur l'ampli.
 11. Sortie **DAC centrée sur 128**, avec mise en forme du bruit de quantification
-    (le son reste net même à très bas volume).
+    (le son reste net même à bas volume).
 
 ### Réglages de départ (déjà dans le code)
 
@@ -113,7 +115,27 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
 | tone (T) | 0.35 | 0.0 – 1.0 |
 | volume (V) | 0.12 | 0.0 – **0.25 max** |
 | effet (E) | 1 (ON) | 0 / 1 |
-| `OUTPUT_LEVEL` | 0.15 | constante dans `PedaleEsclave.ino` |
+| `INPUT_GAIN` | 8.0 (guitare en direct) | constante — mettre 1.0 à 2.0 avec un préampli matériel |
+| `OUTPUT_LEVEL` | 0.45 (amplitude DAC max) | constante — ne pas descendre sous ~0.10 (inaudible) |
+| `DEBUG_METER` | 1 (vu-mètre série ON) | constante — mettre 0 pour jouer sans micro-coupures |
+
+> **Pourquoi ces valeurs :** une guitare branchée en direct ne délivre que ~±100 mV,
+> soit 3 % de la plage de l'ADC. Sans `INPUT_GAIN`, le signal n'atteint jamais le seuil
+> de saturation et la sortie tombe sous ±1 pas du DAC 8 bits — silence total à l'ampli
+> (vérifié par simulation de la chaîne complète). `INPUT_GAIN 8` + volume normalisé
+> donnent un son audible et doux, sans revenir au grésillement d'origine.
+
+### Vu-mètre de diagnostic (port série, 115200 baud)
+
+Avec `DEBUG_METER 1`, l'esclave affiche chaque seconde l'état de toute la chaîne :
+
+```
+[Metre] entree: 118 pas ADC | enveloppe: 0.142 | gate: OUVERT (0.97) | sortie DAC: +/-26 pas | G=2.50 V=0.120 E=1
+[Metre] entree crete: 3 pas ADC — PAS DE SIGNAL GUITARE (verifiez jack, condensateur C1 et pont diviseur)
+```
+
+Lecture rapide : `entree` < 6 pas = problème de câblage d'entrée ; `gate: ferme` en
+jouant = seuils de gate trop hauts ; `sortie DAC: +/-0` = volume à zéro ou effet coupé.
 
 ---
 
@@ -152,6 +174,24 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 `magic` sont ignorés. Plusieurs esclaves peuvent écouter le même broadcast.
 
 ---
+
+## Pas de son du tout ? Checklist dans l'ordre
+
+1. **Ouvrez le moniteur série de l'esclave** (115200 baud) : le vu-mètre dit tout.
+2. `entree crete: < 6 pas — PAS DE SIGNAL GUITARE` → le problème est AVANT l'ESP32 :
+   jack mal branché, C1 absent/coupé, pont diviseur R1/R2 absent (le message
+   « offset DC anormal » au démarrage le confirme), volume de la guitare à zéro.
+3. `entree` correct mais `gate: ferme` en jouant → montez le volume de la guitare ou
+   baissez `GATE_LOW`/`GATE_HIGH`.
+4. `gate: OUVERT` mais `sortie DAC: +/-0` → volume logiciel à zéro : envoyez `V:0.12`
+   depuis le téléphone (ou vérifiez que le maître est allumé : sans maître, l'esclave
+   garde ses valeurs par défaut, qui sont audibles).
+5. `sortie DAC: +/-20` ou plus mais rien à l'ampli → le problème est APRÈS l'ESP32 :
+   câble GPIO25→ampli, condensateur de liaison C3 (indispensable : sans lui certains
+   amplis bloquent), masse commune, canal/volume de l'ampli, ampli sur l'entrée guitare
+   (pas l'entrée AUX).
+6. Testez l'ampli et le câble seuls : touchez la pointe du jack côté ampli avec le
+   doigt → un « bzzz » doit sortir. Sinon, le souci est côté ampli/câble.
 
 ## Dépannage du bruit / grésillement
 

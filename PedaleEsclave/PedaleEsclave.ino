@@ -61,10 +61,24 @@
 #define SAMPLE_RATE_HZ      20000     // 20 kHz : suffisant pour une guitare saturée
 #define SAMPLE_PERIOD_US    (1000000UL / SAMPLE_RATE_HZ)
 
-// Niveau de sortie global : réduit fortement l'amplitude DAC.
-// Montez-le (jusqu'à ~0.5) si vous ajoutez un pont diviseur matériel
-// en sortie du DAC — le son sera moins quantifié (plus propre).
-#define OUTPUT_LEVEL        0.15f
+// Amplification d'entrée logicielle : une guitare branchée en direct ne fait
+// que ~±100 mV, soit ~±120 pas d'ADC sur 4096 (3 % de la pleine échelle).
+// Ce boost la ramène à un niveau exploitable AVANT le gate et la saturation.
+//   - guitare en direct (sans préampli matériel) : 8.0
+//   - avec un préampli matériel (ex. MCP6002 x8) : 1.0 à 2.0
+#define INPUT_GAIN          8.0f
+
+// Amplitude DAC maximale (fraction de la pleine échelle) quand volume = VOLUME_MAX.
+// Avec le volume par défaut (0.12), la sortie fait environ ±27 pas de DAC
+// (~±0,35 V) : audible mais modéré — réglez le niveau final sur l'ampli.
+// NB : en dessous de ~0.10, la sortie tombe sous ±3 pas du DAC 8 bits
+// et devient inaudible/quantifiée : ne descendez pas trop.
+#define OUTPUT_LEVEL        0.45f
+
+// Vu-mètre de diagnostic : 1 = affiche chaque seconde l'état de la chaîne
+// (crête d'entrée, enveloppe, gate, crête DAC) sur le port série.
+// L'affichage bloque l'audio ~5 ms par seconde : mettre 0 pour jouer proprement.
+#define DEBUG_METER         1
 
 // Bornes de sécurité des paramètres (identiques côté maître)
 #define GAIN_MIN            0.5f
@@ -79,9 +93,9 @@
 #define TONE_FREQ_MIN_HZ    700.0f    // tone = 0.0 -> très sombre
 #define TONE_FREQ_MAX_HZ    4500.0f   // tone = 1.0 -> brillant
 
-// Noise gate (amplitudes normalisées, pleine échelle = 1.0)
-#define GATE_LOW            0.008f    // en dessous : fermé (silence)
-#define GATE_HIGH           0.020f    // au-dessus : complètement ouvert
+// Noise gate (amplitudes normalisées APRÈS INPUT_GAIN, pleine échelle = 1.0)
+#define GATE_LOW            0.012f    // en dessous : fermé (silence)
+#define GATE_HIGH           0.030f    // au-dessus : complètement ouvert
 #define ENV_ATTACK          0.05f     // suiveur d'enveloppe : montée rapide
 #define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
 #define GATE_OPEN_COEF      0.010f    // ouverture du gate ~5 ms
@@ -195,6 +209,36 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 }
 
 // ---------------------------------------------------------------------------
+// Vu-mètre de diagnostic (port série, une ligne par seconde)
+// ---------------------------------------------------------------------------
+#if DEBUG_METER
+static float    mPeakIn  = 0.0f;   // crête d'entrée (pas d'ADC, avant boost)
+static int      mPeakOut = 0;      // crête de sortie (pas de DAC autour de 128)
+static uint32_t mCount   = 0;
+
+static inline void meterTick(float raw) {
+  const float dev = fabsf(raw - dcOffset);
+  if (dev > mPeakIn) mPeakIn = dev;
+
+  if (++mCount >= (uint32_t)SAMPLE_RATE_HZ) {   // une fois par seconde
+    if (mPeakIn < 6.0f) {
+      Serial.printf("[Metre] entree crete: %.0f pas ADC — PAS DE SIGNAL GUITARE "
+                    "(verifiez jack, condensateur C1 et pont diviseur)\n", mPeakIn);
+    } else {
+      Serial.printf("[Metre] entree: %.0f pas ADC | enveloppe: %.3f | gate: %s (%.2f) | "
+                    "sortie DAC: +/-%d pas | G=%.2f V=%.3f E=%.0f\n",
+                    mPeakIn, envelope,
+                    (gateGain > 0.5f) ? "OUVERT" : "ferme", gateGain,
+                    mPeakOut, smGain, smVolume, smEffect);
+    }
+    mPeakIn  = 0.0f;
+    mPeakOut = 0;
+    mCount   = 0;
+  }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Traitement d'UN échantillon audio
 // ---------------------------------------------------------------------------
 static inline void processSample() {
@@ -210,7 +254,12 @@ static inline void processSample() {
 
   // ---- 2. Suppression de l'offset DC (suivi lent) ----------------------
   dcOffset += DC_TRACK_COEF * ((float)raw - dcOffset);
-  float x = ((float)raw - dcOffset) * (1.0f / 2048.0f);   // normalise vers ±1
+  // Normalise vers ±1 puis applique le boost d'entrée logiciel
+  float x = ((float)raw - dcOffset) * (INPUT_GAIN / 2048.0f);
+
+#if DEBUG_METER
+  meterTick((float)raw);
+#endif
 
   // ---- 3. Passe-haut ~80 Hz --------------------------------------------
   const float hp = hpfA * (hpPrevY + x - hpPrevX);
@@ -263,8 +312,10 @@ static inline void processSample() {
   // ---- Bypass en fondu : mélange signal propre <-> signal saturé ----------
   const float y = sig + (lpPost - sig) * smEffect;
 
-  // ---- 10. Volume très réduit + niveau de sortie global -------------------
-  const float outF = y * smVolume * OUTPUT_LEVEL;
+  // ---- 10. Volume + niveau de sortie global -------------------------------
+  // Le volume (0..VOLUME_MAX) est normalisé sur 0..1, puis OUTPUT_LEVEL fixe
+  // l'amplitude DAC maximale. À V=0.12 : ~±27 pas de DAC (~±0,35 V), modéré.
+  const float outF = y * (smVolume * (1.0f / VOLUME_MAX)) * OUTPUT_LEVEL;
 
   // ---- 11. DAC 8 bits centré sur 128 + mise en forme du bruit -------------
   // L'erreur de quantification est réinjectée sur l'échantillon suivant :
@@ -274,6 +325,11 @@ static inline void processSample() {
   if (dacVal < 0)   dacVal = 0;
   if (dacVal > 255) dacVal = 255;
   quantErr = desired - (float)dacVal;
+
+#if DEBUG_METER
+  const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
+  if (outDev > mPeakOut) mPeakOut = outDev;
+#endif
 
   dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
 }
