@@ -91,21 +91,27 @@ de liaison et un pont diviseur. Sans ce montage, la moitié négative du signal 
 
 Tout est fait pour un son **propre, doux et silencieux au repos** :
 
-1. Lecture ADC 12 bits sur GPIO34 à 20 kHz.
+1. Lecture ADC 12 bits sur GPIO34 à 20 kHz — **médiane de 3 lectures** : l'ADC de
+   l'ESP32 crache des pics isolés quand le WiFi émet ; amplifiés ×500 ils faisaient
+   un gros grésillement. La médiane les élimine sans adoucir le son.
 2. Suivi et suppression de l'**offset DC** (moyenne glissante lente).
 3. **Passe-haut ~40 Hz** : retire le résidu continu et les basses parasites
    (garde le mi grave de la guitare, 82 Hz).
-4. **Passe-bas ~5 kHz avant saturation** : réduit le bruit ADC avant amplification.
-5. **Noise gate progressif** : suiveur d'enveloppe (attaque rapide, relâchement lent),
-   ouverture/fermeture en fondu — pas de coupure brutale, pas de souffle sans guitare.
-   Gate fermé = sortie strictement à 128 (silence absolu). Placé AVANT le gros gain,
-   sinon le souffle serait amplifié ×500.
+4. **Passe-bas ~4 kHz avant saturation** : coupe le souffle ADC avant le gros gain
+   (les harmoniques brillantes sont recréées par la distorsion elle-même).
+5. **Noise gate progressif** : suiveur d'enveloppe, ouverture/fermeture en fondu —
+   pas de coupure brutale, pas de souffle sans guitare. Gate fermé = sortie
+   strictement à 128 (silence absolu). Placé AVANT le gros gain, et ses **seuils
+   montent avec le drive** (×1 à drive 0, ×4 à drive max), comme le gate d'un
+   ampli high-gain.
 6. **Étage de saturation = émulation du circuit ADTL082** (schéma LTspice) :
-   - potentiomètre **DRIVE** (R5 450k + R6 50k) = paramètre `G` : gain ×51 (G=0)
-     à ×501 (G=1) ;
+   - potentiomètre **DRIVE** = paramètre `G`, course **exponentielle** comme un
+     pot audio : **×2 (G=0, quasi clean) → ×30 (G=0.5, crunch) → ×500 (G=1,
+     heavy metal)** — toute la course du bouton est utile ;
    - réseau C5 220n / R7 1k : le plein gain ne s'applique qu'au-dessus de ~723 Hz
      (graves propres, médiums/aigus qui saturent — le caractère du circuit) ;
-   - C4 100p en contre-réaction : passe-bas 3,2 à 32 kHz selon le drive.
+   - C4 100p en contre-réaction : passe-bas qui descend à 3,2 kHz à drive max
+     (adoucit le grésillement aigu).
 7. **Écrêtage à deux étages** (`tanh`, sans aliasing numérique) :
    - d'abord les **rails ±12 V** de l'ampli op ;
    - puis les **diodes d'écrêtage** (paramètre `D`) : le signal amplifié jusqu'à
@@ -119,8 +125,9 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
    | 2 | LED | ±1,7 V | crunch plus ouvert |
    | 3 | germanium | ±0,3 V | fuzz très compressé |
 
-   Le paramètre `C` module le seuil effectif (plus bas = écrase plus tôt), et le
-   volume perçu ne change pas quand on change `D` ou `C` (renormalisation).
+   Le paramètre `C` règle la **dureté du genou** d'écrêtage : 0.95 = genou doux et
+   rond (tanh), 0.5 = genou dur presque carré → nettement plus d'harmoniques et
+   d'agressivité. Le volume perçu ne change pas quand on change `D` (renormalisation).
 8. **Tone = potentiomètre R8+R9 (10k) + C7 (22n)** = paramètre `T` : passe-bas
    variable ~760 Hz (T=0, sombre) à ~14 kHz (T=1, brillant) ; T=0.5 ≈ 1,45 kHz
    comme le schéma (R8=R9=5k).
@@ -140,25 +147,28 @@ défaut correspondent aux potentiomètres à mi-course, comme sur le schéma.
 
 | Paramètre | Valeur par défaut | Plage autorisée |
 |---|---|---|
-| drive (G) | 0.5 (gain ×276) | 0.0 – 1.0 (×51 à ×501) |
-| clip (C) | 0.85 | 0.50 – 0.95 |
+| drive (G) | 0.5 (gain ×30, crunch) | 0.0 – 1.0 (×2 clean à ×500 heavy metal) |
+| clip (C) | 0.85 (plutôt doux) | 0.50 (dur/agressif) – 0.95 (doux/rond) |
 | tone (T) | 0.5 (≈1,45 kHz) | 0.0 – 1.0 |
 | volume (V) | 0.5 | 0.0 – 1.0 |
 | effet (E) | 1 (ON) | 0 / 1 |
 | diodes (D) | 1 (silicium) | 0 = sans, 1 = silicium, 2 = LED, 3 = germanium |
 | `INPUT_GAIN` | 2.0 (micro simple bobinage) | constante — 1.0 = fidèle au circuit, 3–4 si signal faible |
 | `OUTPUT_LEVEL` | 0.45 (amplitude DAC max à V=1) | constante — ne pas descendre sous ~0.10 (inaudible) |
-| `DEBUG_METER` | 1 (vu-mètre série ON) | constante — mettre 0 pour jouer sans micro-coupures |
+| `DEBUG_METER` | **0 (OFF pour jouer)** | constante — mettre 1 SEULEMENT pour diagnostiquer : chaque affichage coupe l'audio ~10 ms → un craquement par seconde |
 
-> **Vérifié par simulation** (vrai code compilé hors carte, corde de La pincée
-> injectée dans l'ADC) : les crêtes de sortie plafonnent à ±24-25 pas de DAC pendant
-> que l'énergie (RMS) double quand on monte le niveau d'entrée ou le drive — c'est
-> l'aplatissement des crêtes attendu d'un ampli op poussé à ses rails. Sans guitare :
-> DAC constant à 128, silence absolu.
+> **Vérifié par simulation** (vrai code compilé hors carte, corde de La pincée +
+> parasites ADC type WiFi injectés) : sans guitare, DAC constant à 128 **même avec
+> les parasites** (médiane + gate). Balayage du drive : facteur de crête 2,7 (G=0,
+> quasi sinus) → 1,16 (G=1, quasi carré = heavy metal) pendant que l'énergie RMS
+> est multipliée par 7. Clip : 1,57 (doux) → 1,19 (dur) à réglages égaux.
 
 ### Vu-mètre de diagnostic (port série, 115200 baud)
 
-Avec `DEBUG_METER 1`, l'esclave affiche chaque seconde l'état de toute la chaîne :
+Le vu-mètre est **désactivé par défaut** (chaque affichage coupe l'audio ~10 ms →
+un craquement par seconde). Pour diagnostiquer : mettre `DEBUG_METER 1` en tête de
+`PedaleEsclave.ino`, re-téléverser, et l'esclave affiche chaque seconde l'état de
+toute la chaîne (remettre 0 pour jouer) :
 
 ```
 [Metre] entree: 118 pas ADC | enveloppe: 0.142 | gate: OUVERT (0.97) | sortie DAC: +/-26 pas | G=0.50 V=0.500 E=1
@@ -185,7 +195,7 @@ jouant = seuils de gate trop hauts ; `sortie DAC: +/-0` = volume à zéro ou eff
 
 ### La page de contrôle
 
-- **4 jauges** : Drive (gain ×51 à ×501), Clip (seuil d'écrêtage), Tone (sombre →
+- **4 jauges** : Drive (×2 clean → ×500 heavy metal), Clip (dureté), Tone (sombre →
   brillant), Volume — chaque geste est envoyé à la pédale en ~120 ms.
 - **4 boutons diodes** : sans / silicium / LED / germanium.
 - **Footswitch** ON / bypass.
@@ -205,8 +215,8 @@ GET http://192.168.4.1/api/set?g=0.8&t=0.4&v=0.6&e=1&d=1
 
 | Clé | Rôle | Plage |
 |---|---|---|
-| `g` | drive (pot R5+R6 : gain ×51 à ×501) | 0.0 – 1.0 |
-| `c` | seuil d'écrêtage (plus bas = écrase plus tôt) | 0.5 – 0.95 |
+| `g` | drive (exponentiel : ×2 clean → ×500 heavy metal) | 0.0 – 1.0 |
+| `c` | dureté de l'écrêtage (plus bas = plus dur/agressif) | 0.5 – 0.95 |
 | `t` | tone (pot R8+R9 : 0 = sombre, 1 = brillant) | 0.0 – 1.0 |
 | `v` | volume (pot R10+R11) | 0.0 – 1.0 |
 | `e` | effet ON / bypass | 0 / 1 |
@@ -237,7 +247,8 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 
 ## Pas de son du tout ? Checklist dans l'ordre
 
-1. **Ouvrez le moniteur série de l'esclave** (115200 baud) : le vu-mètre dit tout.
+1. Mettez `DEBUG_METER 1` dans `PedaleEsclave.ino`, re-téléversez, puis **ouvrez le
+   moniteur série de l'esclave** (115200 baud) : le vu-mètre dit tout.
 2. `entree crete: < 6 pas — PAS DE SIGNAL GUITARE` → le problème est AVANT l'ESP32 :
    jack mal branché, C1 absent/coupé, pont diviseur R1/R2 absent (le message
    « offset DC anormal » au démarrage le confirme), volume de la guitare à zéro.
