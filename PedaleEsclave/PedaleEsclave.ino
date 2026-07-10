@@ -18,9 +18,11 @@
  *    4.  Filtre passe-bas ~5 kHz AVANT saturation (réduit le bruit ADC).
  *    5.  Noise gate PROGRESSIF (suiveur d'enveloppe + gain lissé :
  *        pas de coupure brutale, silence total sans guitare).
- *    6.  Gain modéré (borné à GAIN_MAX).
- *    7.  Saturation DOUCE (soft clipping à genou tanh, pas de hard clip).
- *    8.  Filtre passe-bas de tonalité APRÈS saturation (calme les aigus).
+ *    6.  Étage de saturation = émulation du circuit ADTL082 (schéma LTspice) :
+ *        gain x51..x501 (pot DRIVE R5+R6), shelf C5/R7 (graves non amplifiés),
+ *        passe-bas C4 en contre-réaction.
+ *    7.  Écrêtage aux rails ±12 V (tanh) : crêtes aplaties, vraie saturation.
+ *    8.  Tone = pot R8+R9 + C7 : passe-bas variable APRÈS saturation.
  *    9.  Lissage de TOUS les paramètres reçus (pas de craquement).
  *    10. Volume très réduit + facteur global OUTPUT_LEVEL.
  *    11. Écriture DAC 8 bits centrée sur 128 (+ mise en forme du bruit
@@ -61,16 +63,40 @@
 #define SAMPLE_RATE_HZ      20000     // 20 kHz : suffisant pour une guitare saturée
 #define SAMPLE_PERIOD_US    (1000000UL / SAMPLE_RATE_HZ)
 
-// Amplification d'entrée logicielle : une guitare branchée en direct ne fait
-// que ~±100 mV, soit ~±120 pas d'ADC sur 4096 (3 % de la pleine échelle).
-// Ce boost la ramène à un niveau exploitable AVANT le gate et la saturation.
-//   - guitare en direct (sans préampli matériel) : 8.0
-//   - avec un préampli matériel (ex. MCP6002 x8) : 1.0 à 2.0
-#define INPUT_GAIN          8.0f
+// Amplification d'entrée logicielle, AVANT l'étage de saturation.
+// 2.0 = équivalent d'un micro un peu plus chaud : garantit un écrêtage franc
+// des crêtes avec un simple bobinage (~100 mV). Mettre 1.0 pour être
+// strictement fidèle au circuit, 3.0-4.0 si le signal reste trop propre
+// (vérifiez la crête d'entrée au vu-mètre).
+#define INPUT_GAIN          2.0f
 
-// Amplitude DAC maximale (fraction de la pleine échelle) quand volume = VOLUME_MAX.
-// Avec le volume par défaut (0.12), la sortie fait environ ±27 pas de DAC
-// (~±0,35 V) : audible mais modéré — réglez le niveau final sur l'ampli.
+// --- Émulation du circuit de saturation ADTL082 (schéma LTspice) -----------
+// Ampli op non-inverseur qui sature sur ses rails ±12 V :
+//   R7 1 kΩ + C5 220 nF (jambe de gain)  -> le plein gain ne s'applique
+//     qu'au-dessus de ~723 Hz : graves propres, médiums/aigus boostés.
+//   R6 50 kΩ + R5 450 kΩ (potentiomètre DRIVE = paramètre G, 0..1)
+//     -> gain x51 (G=0, quasi clean) à x501 (G=1, fuzz).
+//   C4 100 pF en contre-réaction -> passe-bas 3,2 à 32 kHz selon le drive.
+//   Écrêtage aux rails ±12 V -> crêtes aplaties (la vraie saturation).
+// En unités normalisées (±1 = ±1,65 V côté ADC), les rails valent ±7,27.
+#define AMP_R7_OHMS         1000.0f
+#define AMP_R6_OHMS         50e3f
+#define AMP_R5_OHMS         450e3f
+#define AMP_SHELF_HZ        723.0f     // zéro posé par C5/R7
+#define AMP_C4_FARADS       100e-12f
+#define RAIL_NORM           7.27f      // ±12 V exprimés en unités ADC (±1,65 V)
+#define BYPASS_GAIN         8.0f       // rattrapage de niveau quand l'effet est coupé
+
+// --- Tone : potentiomètre R8+R9 (10 kΩ) + C7 (22 nF) -----------------------
+// Passe-bas variable : T=1 -> brillant (~14 kHz), T=0.5 -> ~1,4 kHz (comme le
+// schéma avec R8=R9=5k), T=0 -> sombre (~760 Hz).
+#define TONE_C7_FARADS      22e-9f
+#define TONE_R_MIN_OHMS     500.0f
+#define TONE_R_MAX_OHMS     9500.0f
+
+// Amplitude DAC maximale (fraction de la pleine échelle) quand volume = 1.0.
+// Avec le volume par défaut (V=0.5), la sortie fait ~±28 pas de DAC (~±0,37 V) :
+// audible mais modéré — le niveau final se règle sur l'ampli.
 // NB : en dessous de ~0.10, la sortie tombe sous ±3 pas du DAC 8 bits
 // et devient inaudible/quantifiée : ne descendez pas trop.
 #define OUTPUT_LEVEL        0.45f
@@ -81,21 +107,23 @@
 #define DEBUG_METER         1
 
 // Bornes de sécurité des paramètres (identiques côté maître)
-#define GAIN_MIN            0.5f
-#define GAIN_MAX            6.0f
-#define CLIP_MIN            0.50f
+// G, T et V sont maintenant des POSITIONS DE POTENTIOMÈTRE, de 0.0 à 1.0 :
+//   G = drive (R5+R6), T = tone (R8+R9), V = volume (R10+R11)
+#define GAIN_MIN            0.0f
+#define GAIN_MAX            1.0f
+#define CLIP_MIN            0.50f     // C réduit virtuellement les rails ±12 V
 #define CLIP_MAX            0.95f
-#define VOLUME_MAX          0.25f     // plafond logiciel absolu
+#define VOLUME_MAX          1.0f
 
 // Filtres fixes
-#define HPF_FREQ_HZ         80.0f     // passe-haut d'entrée
+#define HPF_FREQ_HZ         40.0f     // passe-haut d'entrée (garde le mi grave 82 Hz)
 #define LPF_PRE_FREQ_HZ     5000.0f   // passe-bas avant saturation
-#define TONE_FREQ_MIN_HZ    700.0f    // tone = 0.0 -> très sombre
-#define TONE_FREQ_MAX_HZ    4500.0f   // tone = 1.0 -> brillant
 
-// Noise gate (amplitudes normalisées APRÈS INPUT_GAIN, pleine échelle = 1.0)
-#define GATE_LOW            0.012f    // en dessous : fermé (silence)
-#define GATE_HIGH           0.030f    // au-dessus : complètement ouvert
+// Noise gate — placé AVANT le gros gain, sinon le souffle serait amplifié x500.
+// Amplitudes normalisées (pleine échelle ADC = 1.0). Une guitare directe fait
+// ~0.06 en crête, le bruit ADC ~0.001.
+#define GATE_LOW            0.003f    // en dessous : fermé (silence)
+#define GATE_HIGH           0.009f    // au-dessus : complètement ouvert
 #define ENV_ATTACK          0.05f     // suiveur d'enveloppe : montée rapide
 #define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
 #define GATE_OPEN_COEF      0.010f    // ouverture du gate ~5 ms
@@ -122,33 +150,39 @@ typedef struct __attribute__((packed)) {
 } PedalParams;
 
 // Cibles reçues par radio (écrites par le callback ESP-NOW, lues par l'audio)
-static volatile float tgtGain   = 2.5f;
-static volatile float tgtClip   = 0.85f;
-static volatile float tgtTone   = 0.35f;
-static volatile float tgtVolume = 0.12f;
+// Défauts = potentiomètres à mi-course, comme sur le schéma (R5=R6 -> drive
+// à 0.5 serait 275k ; on part à 0.5 ; R8=R9 -> tone 0.5 ; R10=R11 -> vol 0.5)
+static volatile float tgtGain   = 0.5f;   // position du pot DRIVE (0..1)
+static volatile float tgtClip   = 0.90f;  // hauteur des rails (0.5..0.95)
+static volatile float tgtTone   = 0.5f;   // position du pot TONE (0..1)
+static volatile float tgtVolume = 0.5f;   // position du pot VOLUME (0..1)
 static volatile float tgtEffect = 1.0f;   // 1 = effet, 0 = bypass (fondu doux)
 
 // ---------------------------------------------------------------------------
 // État du traitement audio
 // ---------------------------------------------------------------------------
 static float dcOffset  = 2048.0f;  // milieu de l'ADC 12 bits
-static float hpPrevX   = 0.0f, hpPrevY = 0.0f;   // passe-haut
+static float hpPrevX   = 0.0f, hpPrevY = 0.0f;   // passe-haut d'entrée
 static float lpPre     = 0.0f;                    // passe-bas pré-saturation
-static float lpPost    = 0.0f;                    // passe-bas de tonalité
+static float shPrevX   = 0.0f, shPrevY = 0.0f;   // passe-haut du shelf de gain (C5/R7)
+static float lpC4      = 0.0f;                    // passe-bas C4 (contre-réaction)
+static float lpPost    = 0.0f;                    // passe-bas de tonalité (C7)
 static float envelope  = 0.0f;                    // suiveur d'enveloppe
 static float gateGain  = 0.0f;                    // gain du gate (0..1)
 static float quantErr  = 0.0f;                    // mise en forme du bruit DAC
 
 // Paramètres lissés (valeurs effectives utilisées par l'audio)
-static float smGain    = 2.5f;
-static float smClip    = 0.85f;
-static float smTone    = 0.35f;
+static float smGain    = 0.5f;
+static float smClip    = 0.90f;
+static float smTone    = 0.5f;
 static float smVolume  = 0.0f;     // démarre à 0 : montée en douceur, pas de "pop"
 static float smEffect  = 1.0f;
 
 // Coefficients calculés au setup()
 static float hpfA        = 0.0f;
 static float lpfPreAlpha = 0.0f;
+static float shelfA      = 0.0f;   // passe-haut 723 Hz du shelf de gain
+#define DT_SEC (1.0f / (float)SAMPLE_RATE_HZ)
 
 static uint32_t nextSampleUs = 0;
 
@@ -291,31 +325,44 @@ static inline void processSample() {
     return;
   }
 
-  // ---- 6. Gain modéré ----------------------------------------------------
-  const float driven = sig * smGain;
+  // ---- 6. Étage ADTL082 : gain x51..x501 avec shelf (C5/R7) ---------------
+  // Le pot DRIVE (G) fixe Rf = R6 + G*R5 ; gain haut-médium = 1 + Rf/R7.
+  // Le réseau C5/R7 fait que seules les fréquences > ~723 Hz reçoivent le
+  // plein gain : on l'émule en n'amplifiant que la partie passe-haut du signal.
+  const float rfOhms  = AMP_R6_OHMS + smGain * AMP_R5_OHMS;
+  const float ampGain = 1.0f + rfOhms / AMP_R7_OHMS;
 
-  // ---- 7. Saturation douce (genou tanh au-delà du seuil "clip") ----------
-  // En dessous du seuil : signal intact. Au-dessus : compression progressive
-  // vers ±1. Jamais d'écrêtage dur, donc pas d'aigus stridents.
-  const float th   = smClip;
-  const float knee = 1.0f - th;
-  float sat;
-  if      (driven >  th) sat =  th + knee * tanhf((driven - th) / knee);
-  else if (driven < -th) sat = -th - knee * tanhf((-driven - th) / knee);
-  else                   sat = driven;
+  const float sh = shelfA * (shPrevY + sig - shPrevX);   // passe-haut 723 Hz
+  shPrevX = sig;
+  shPrevY = sh;
+  float amp = sig + (ampGain - 1.0f) * sh;
 
-  // ---- 8. Passe-bas de tonalité après saturation --------------------------
-  const float toneFreq  = TONE_FREQ_MIN_HZ + smTone * (TONE_FREQ_MAX_HZ - TONE_FREQ_MIN_HZ);
-  const float toneAlpha = lowpassAlpha(toneFreq);
-  lpPost += toneAlpha * (sat - lpPost);
+  // Passe-bas C4 en contre-réaction : 3,2 kHz (drive max) à 32 kHz (drive min)
+  const float rc4 = rfOhms * AMP_C4_FARADS;
+  lpC4 += (DT_SEC / (rc4 + DT_SEC)) * (amp - lpC4);
+  amp = lpC4;
+
+  // ---- 7. Écrêtage aux rails ±12 V : les crêtes sont aplaties -------------
+  // Le paramètre C abaisse virtuellement les rails (C=0.95 -> presque ±12 V).
+  // tanh donne le même aplatissement qu'un ampli op poussé aux rails, sans
+  // les harmoniques d'aliasing d'un écrêtage numérique dur.
+  const float rail = RAIL_NORM * smClip;
+  float sat = rail * tanhf(amp / rail);
+  sat *= (1.0f / RAIL_NORM);          // renormalise : pleins rails -> ±1
+
+  // ---- 8. Tone : pot R8+R9 + C7, passe-bas variable après saturation ------
+  const float rTone = TONE_R_MIN_OHMS + (1.0f - smTone) * (TONE_R_MAX_OHMS - TONE_R_MIN_OHMS);
+  const float rcT   = rTone * TONE_C7_FARADS;
+  lpPost += (DT_SEC / (rcT + DT_SEC)) * (sat - lpPost);
 
   // ---- Bypass en fondu : mélange signal propre <-> signal saturé ----------
-  const float y = sig + (lpPost - sig) * smEffect;
+  // (le signal propre est remonté pour rester comparable au signal d'effet)
+  const float dry = sig * BYPASS_GAIN;
+  const float y   = dry + (lpPost - dry) * smEffect;
 
-  // ---- 10. Volume + niveau de sortie global -------------------------------
-  // Le volume (0..VOLUME_MAX) est normalisé sur 0..1, puis OUTPUT_LEVEL fixe
-  // l'amplitude DAC maximale. À V=0.12 : ~±27 pas de DAC (~±0,35 V), modéré.
-  const float outF = y * (smVolume * (1.0f / VOLUME_MAX)) * OUTPUT_LEVEL;
+  // ---- 10. Volume (pot R10+R11) + niveau de sortie global -----------------
+  // OUTPUT_LEVEL fixe l'amplitude DAC maximale à V=1. À V=0.5 : ~±28 pas.
+  const float outF = y * smVolume * OUTPUT_LEVEL;
 
   // ---- 11. DAC 8 bits centré sur 128 + mise en forme du bruit -------------
   // L'erreur de quantification est réinjectée sur l'échantillon suivant :
@@ -357,6 +404,7 @@ void setup() {
   // --- Coefficients de filtres fixes ---
   hpfA        = highpassA(HPF_FREQ_HZ);
   lpfPreAlpha = lowpassAlpha(LPF_PRE_FREQ_HZ);
+  shelfA      = highpassA(AMP_SHELF_HZ);
 
   // --- WiFi / ESP-NOW (réception uniquement) ---
   WiFi.mode(WIFI_STA);

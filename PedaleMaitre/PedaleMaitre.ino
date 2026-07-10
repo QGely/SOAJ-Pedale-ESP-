@@ -41,14 +41,16 @@
 #define RESEND_PERIOD_MS  300        // renvoi périodique des paramètres
 
 // Bornes de sécurité (identiques côté esclave — défense en profondeur)
-#define GAIN_MIN    0.5f
-#define GAIN_MAX    6.0f
+// G, T et V sont des positions de potentiomètre (0.0 à 1.0), comme sur le
+// circuit : G = drive (R5+R6), T = tone (R8+R9), V = volume (R10+R11).
+#define GAIN_MIN    0.0f
+#define GAIN_MAX    1.0f
 #define CLIP_MIN    0.50f
 #define CLIP_MAX    0.95f
 #define TONE_MIN    0.0f
 #define TONE_MAX    1.0f
 #define VOLUME_MIN  0.0f
-#define VOLUME_MAX  0.25f            // volume logiciel plafonné
+#define VOLUME_MAX  1.0f
 
 // ---------------------------------------------------------------------------
 // Paquet de paramètres (DOIT rester identique dans PedaleEsclave.ino)
@@ -57,20 +59,20 @@
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
-  float    gain;      // 0.5 .. 6.0
-  float    clip;      // 0.50 .. 0.95 (seuil de saturation douce)
-  float    tone;      // 0.0 .. 1.0   (0 = sombre, 1 = brillant)
-  float    volume;    // 0.0 .. 0.25
+  float    gain;      // 0.0 .. 1.0  position du pot DRIVE (gain ampli x51..x501)
+  float    clip;      // 0.50 .. 0.95 hauteur des rails d'écrêtage
+  float    tone;      // 0.0 .. 1.0  position du pot TONE (0 = sombre, 1 = brillant)
+  float    volume;    // 0.0 .. 1.0  position du pot VOLUME
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
 } PedalParams;
 
-// Valeurs de départ demandées : son doux, volume très bas
+// Valeurs de départ : potentiomètres à mi-course, comme sur le schéma
 static PedalParams params = {
   PARAMS_MAGIC,
-  2.5f,    // gain
-  0.85f,   // clip
-  0.35f,   // tone
-  0.12f,   // volume
+  0.5f,    // drive
+  0.90f,   // clip (rails presque pleins)
+  0.5f,    // tone
+  0.5f,    // volume
   1        // effet ON
 };
 
@@ -231,7 +233,7 @@ void setup() {
   pAdvertising->start();
 
   Serial.printf("[BLE] Publicité démarrée : \"%s\"\n", BLE_DEVICE_NAME);
-  Serial.println("Format des commandes : G:2.5;C:0.85;T:0.35;V:0.12;E:1");
+  Serial.println("Format des commandes : G:0.5;C:0.90;T:0.5;V:0.5;E:1 (pots 0.0 a 1.0)");
 }
 
 // ---------------------------------------------------------------------------
