@@ -155,9 +155,12 @@
                                       // Volontairement pas plus rapide : un
                                       // parasite d'UN échantillon ne doit pas
                                       // pouvoir ouvrir le gate (anti-crachotis)
-#define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
+#define ENV_RELEASE         0.001f    // descente ~50 ms (assez lent pour le
+                                      // sustain, assez rapide pour couper court)
 #define GATE_OPEN_COEF      0.010f    // ouverture du gate ~5 ms
-#define GATE_CLOSE_COEF     0.0008f   // fermeture douce ~60 ms (garde le sustain)
+#define GATE_CLOSE_COEF     0.0025f   // fermeture ~20 ms : la fin de note
+                                      // s'arrête net au lieu de "redescendre"
+                                      // en grésillant pendant 400 ms
 
 // Lissage des paramètres reçus (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
@@ -373,6 +376,7 @@ static inline void processSample() {
   if      (envelope <= gLow)  gateTarget = 0.0f;
   else if (envelope >= gHigh) gateTarget = 1.0f;
   else    gateTarget = (envelope - gLow) / (gHigh - gLow);
+  gateTarget *= gateTarget;   // pente d'expandeur : fermeture décidée, pas molle
 
   gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : GATE_CLOSE_COEF)
               * (gateTarget - gateGain);
@@ -427,10 +431,18 @@ static inline void processSample() {
   const float rcT   = rTone * TONE_C7_FARADS;
   lpPost += (DT_SEC / (rcT + DT_SEC)) * (clipped - lpPost);
 
+  // ---- Gate de SORTIE (le même gain, appliqué après la saturation) --------
+  // Le fondu d'entrée seul ne suffit pas : la distorsion le compresse (elle
+  // remonte tout au niveau d'écrêtage), donc pendant la fermeture on
+  // entendait le bruit amplifié "redescendre" en grésillant. Multiplier
+  // aussi la SORTIE par le gain du gate coupe réellement le son — c'est le
+  // montage des noise gates d'ampli high-gain (atténuation au carré).
+  const float wet = lpPost * gateGain;
+
   // ---- Bypass en fondu : mélange signal propre <-> signal saturé ----------
   // (le signal propre est remonté pour rester comparable au signal d'effet)
   const float dry = sig * BYPASS_GAIN;
-  const float y   = dry + (lpPost - dry) * smEffect;
+  const float y   = dry + (wet - dry) * smEffect;
 
   // ---- 10. Volume (pot R10+R11) + niveau de sortie global -----------------
   // OUTPUT_LEVEL fixe l'amplitude DAC maximale à V=1. À V=0.5 : ~±28 pas.

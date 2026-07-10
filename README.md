@@ -99,11 +99,15 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
    (garde le mi grave de la guitare, 82 Hz).
 4. **Passe-bas ~4 kHz avant saturation** : coupe le souffle ADC avant le gros gain
    (les harmoniques brillantes sont recréées par la distorsion elle-même).
-5. **Noise gate progressif** : suiveur d'enveloppe, ouverture/fermeture en fondu —
-   pas de coupure brutale, pas de souffle sans guitare. Gate fermé = sortie
-   strictement à 128 (silence absolu). Placé AVANT le gros gain, et ses **seuils
-   montent avec le drive** (×1 à drive 0, ×4 à drive max), comme le gate d'un
-   ampli high-gain.
+5. **Noise gate double** (entrée ET sortie), comme sur les amplis high-gain :
+   - en entrée, avant le gros gain (sinon le souffle serait amplifié ×500) ;
+   - **en sortie, après la saturation** : la distorsion compresse le fondu
+     d'entrée (elle remonte tout au niveau d'écrêtage), donc sans gate de
+     sortie on entendait le bruit « redescendre » en grésillant à chaque fin
+     de note. Le gate de sortie coupe réellement le son (atténuation au carré).
+   - Fermeture décidée (~20 ms, pente d'expandeur) : la fin de note s'arrête
+     net. Seuils qui **montent avec le drive** (×1 à drive 0, ×4 à drive max).
+   - Gate fermé = sortie strictement à 128 (silence absolu).
 6. **Étage de saturation = émulation du circuit ADTL082** (schéma LTspice) :
    - potentiomètre **DRIVE** = paramètre `G`, course **exponentielle** comme un
      pot audio : **×2 (G=0, quasi clean) → ×30 (G=0.5, crunch) → ×500 (G=1,
