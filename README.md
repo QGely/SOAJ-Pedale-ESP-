@@ -89,31 +89,80 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
 
 1. Lecture ADC 12 bits sur GPIO34 à 20 kHz.
 2. Suivi et suppression de l'**offset DC** (moyenne glissante lente).
-3. **Passe-haut ~80 Hz** : retire le résidu continu et les basses parasites.
+3. **Passe-haut ~40 Hz** : retire le résidu continu et les basses parasites
+   (garde le mi grave de la guitare, 82 Hz).
 4. **Passe-bas ~5 kHz avant saturation** : réduit le bruit ADC avant amplification.
 5. **Noise gate progressif** : suiveur d'enveloppe (attaque rapide, relâchement lent),
    ouverture/fermeture en fondu — pas de coupure brutale, pas de souffle sans guitare.
-   Gate fermé = sortie strictement à 128 (silence absolu).
-6. **Gain modéré**, borné à ×6 maximum.
-7. **Soft clipping** : linéaire sous le seuil `clip`, puis compression douce en `tanh`
-   vers ±1. Jamais d'écrêtage dur, donc pas d'aigus stridents.
-8. **Passe-bas de tonalité après saturation** (700 Hz – 4,5 kHz selon `tone`).
+   Gate fermé = sortie strictement à 128 (silence absolu). Placé AVANT le gros gain,
+   sinon le souffle serait amplifié ×500.
+6. **Étage de saturation = émulation du circuit ADTL082** (schéma LTspice) :
+   - potentiomètre **DRIVE** (R5 450k + R6 50k) = paramètre `G` : gain ×51 (G=0)
+     à ×501 (G=1) ;
+   - réseau C5 220n / R7 1k : le plein gain ne s'applique qu'au-dessus de ~723 Hz
+     (graves propres, médiums/aigus qui saturent — le caractère du circuit) ;
+   - C4 100p en contre-réaction : passe-bas 3,2 à 32 kHz selon le drive.
+7. **Écrêtage à deux étages** (`tanh`, sans aliasing numérique) :
+   - d'abord les **rails ±12 V** de l'ampli op ;
+   - puis les **diodes d'écrêtage** (paramètre `D`) : le signal amplifié jusqu'à
+     ±12 V vient s'écraser sur le seuil des diodes — c'est là que se fait le gros
+     de la saturation (~20× plus agressif que les rails seuls en silicium).
+
+   | `D` | Diodes | Seuil | Caractère |
+   |---|---|---|---|
+   | 0 | aucune | rails ±12 V | boost léger, presque clean |
+   | **1** | silicium (2×1N4148) | ±0,6 V | **saturation forte (défaut)** |
+   | 2 | LED | ±1,7 V | crunch plus ouvert |
+   | 3 | germanium | ±0,3 V | fuzz très compressé |
+
+   Le paramètre `C` module le seuil effectif (plus bas = écrase plus tôt), et le
+   volume perçu ne change pas quand on change `D` ou `C` (renormalisation).
+8. **Tone = potentiomètre R8+R9 (10k) + C7 (22n)** = paramètre `T` : passe-bas
+   variable ~760 Hz (T=0, sombre) à ~14 kHz (T=1, brillant) ; T=0.5 ≈ 1,45 kHz
+   comme le schéma (R8=R9=5k).
 9. **Lissage de tous les paramètres** (~60 ms) : aucun craquement quand on change une
    valeur ou qu'on active/désactive l'effet (le bypass est un fondu enchaîné).
-10. **Volume très réduit** (plafond logiciel 0,25) × facteur global `OUTPUT_LEVEL` (0,15).
+10. **Volume** (pot R10+R11, 0 à 1) × amplitude DAC maximale `OUTPUT_LEVEL`.
+    Au volume par défaut (0,5), la sortie fait ~±28 pas de DAC (~±0,37 V) : audible
+    mais modéré — le niveau final se règle sur l'ampli.
 11. Sortie **DAC centrée sur 128**, avec mise en forme du bruit de quantification
-    (le son reste net même à très bas volume).
+    (le son reste net même à bas volume).
 
 ### Réglages de départ (déjà dans le code)
 
+`G`, `T` et `V` sont des **positions de potentiomètre, de 0.0 à 1.0**, comme sur le
+circuit : G = drive (R5+R6), T = tone (R8+R9), V = volume (R10+R11). Les valeurs par
+défaut correspondent aux potentiomètres à mi-course, comme sur le schéma.
+
 | Paramètre | Valeur par défaut | Plage autorisée |
 |---|---|---|
-| gain (G) | 2.5 | 0.5 – 6.0 |
+| drive (G) | 0.5 (gain ×276) | 0.0 – 1.0 (×51 à ×501) |
 | clip (C) | 0.85 | 0.50 – 0.95 |
-| tone (T) | 0.35 | 0.0 – 1.0 |
-| volume (V) | 0.12 | 0.0 – **0.25 max** |
+| tone (T) | 0.5 (≈1,45 kHz) | 0.0 – 1.0 |
+| volume (V) | 0.5 | 0.0 – 1.0 |
 | effet (E) | 1 (ON) | 0 / 1 |
-| `OUTPUT_LEVEL` | 0.15 | constante dans `PedaleEsclave.ino` |
+| diodes (D) | 1 (silicium) | 0 = sans, 1 = silicium, 2 = LED, 3 = germanium |
+| `INPUT_GAIN` | 2.0 (micro simple bobinage) | constante — 1.0 = fidèle au circuit, 3–4 si signal faible |
+| `OUTPUT_LEVEL` | 0.45 (amplitude DAC max à V=1) | constante — ne pas descendre sous ~0.10 (inaudible) |
+| `DEBUG_METER` | 1 (vu-mètre série ON) | constante — mettre 0 pour jouer sans micro-coupures |
+
+> **Vérifié par simulation** (vrai code compilé hors carte, corde de La pincée
+> injectée dans l'ADC) : les crêtes de sortie plafonnent à ±24-25 pas de DAC pendant
+> que l'énergie (RMS) double quand on monte le niveau d'entrée ou le drive — c'est
+> l'aplatissement des crêtes attendu d'un ampli op poussé à ses rails. Sans guitare :
+> DAC constant à 128, silence absolu.
+
+### Vu-mètre de diagnostic (port série, 115200 baud)
+
+Avec `DEBUG_METER 1`, l'esclave affiche chaque seconde l'état de toute la chaîne :
+
+```
+[Metre] entree: 118 pas ADC | enveloppe: 0.142 | gate: OUVERT (0.97) | sortie DAC: +/-26 pas | G=0.50 V=0.500 E=1
+[Metre] entree crete: 3 pas ADC — PAS DE SIGNAL GUITARE (verifiez jack, condensateur C1 et pont diviseur)
+```
+
+Lecture rapide : `entree` < 6 pas = problème de câblage d'entrée ; `gate: ferme` en
+jouant = seuils de gate trop hauts ; `sortie DAC: +/-0` = volume à zéro ou effet coupé.
 
 ---
 
@@ -130,15 +179,17 @@ Le maître s'annonce sous le nom **`SOAJ-Pedale`** avec un service type *Nordic 
 Compatible avec **nRF Connect**, **Serial Bluetooth Terminal** (mode BLE) ou votre propre
 appli iOS/Android/Harmony.
 
-Commandes texte (UTF-8), une ou plusieurs à la fois, séparées par `;` :
+Commandes texte (UTF-8), une ou plusieurs à la fois, séparées par `;`.
+Chaque valeur est une position de potentiomètre entre 0.0 et 1.0 :
 
 ```
-G:2.5        → gain
-C:0.85       → seuil de saturation
-T:0.35       → tonalité (0 = sombre, 1 = brillant)
-V:0.12       → volume (plafonné à 0.25)
+G:0.5        → drive (pot R5+R6 : gain ×51 à ×501)
+C:0.85       → seuil d'écrêtage (0.5 à 0.95, plus bas = écrase plus tôt)
+T:0.5        → tone (pot R8+R9 : 0 = sombre, 1 = brillant)
+V:0.5        → volume (pot R10+R11)
 E:1  /  E:0  → effet ON / bypass
-G:3.0;T:0.4;V:0.10;E:1   → tout en une commande
+D:1          → diodes : 0 = sans, 1 = silicium, 2 = LED, 3 = germanium
+G:0.8;T:0.4;V:0.6;E:1;D:1    → tout en une commande
 ```
 
 Toute valeur hors plage est automatiquement ramenée dans les bornes (côté maître **et**
@@ -153,14 +204,32 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 
 ---
 
+## Pas de son du tout ? Checklist dans l'ordre
+
+1. **Ouvrez le moniteur série de l'esclave** (115200 baud) : le vu-mètre dit tout.
+2. `entree crete: < 6 pas — PAS DE SIGNAL GUITARE` → le problème est AVANT l'ESP32 :
+   jack mal branché, C1 absent/coupé, pont diviseur R1/R2 absent (le message
+   « offset DC anormal » au démarrage le confirme), volume de la guitare à zéro.
+3. `entree` correct mais `gate: ferme` en jouant → montez le volume de la guitare ou
+   baissez `GATE_LOW`/`GATE_HIGH`.
+4. `gate: OUVERT` mais `sortie DAC: +/-0` → volume logiciel à zéro : envoyez `V:0.5`
+   depuis le téléphone (ou vérifiez que le maître est allumé : sans maître, l'esclave
+   garde ses valeurs par défaut, qui sont audibles).
+5. `sortie DAC: +/-20` ou plus mais rien à l'ampli → le problème est APRÈS l'ESP32 :
+   câble GPIO25→ampli, condensateur de liaison C3 (indispensable : sans lui certains
+   amplis bloquent), masse commune, canal/volume de l'ampli, ampli sur l'entrée guitare
+   (pas l'entrée AUX).
+6. Testez l'ampli et le câble seuls : touchez la pointe du jack côté ampli avec le
+   doigt → un « bzzz » doit sortir. Sinon, le souci est côté ampli/câble.
+
 ## Dépannage du bruit / grésillement
 
 | Symptôme | Cause probable | Solution |
 |---|---|---|
 | Grésillement continu, même sans jouer | Pas de pont diviseur sur GPIO34 (le message série « offset DC anormal » apparaît) | Câbler C1 + R1 + R2 comme ci-dessus |
-| Souffle amplifié | Gain trop haut pour un signal d'entrée trop faible | Baisser `G`, ajouter un préampli matériel |
+| Souffle amplifié | Gain trop haut pour un signal d'entrée trop faible | Baisser `G` ou `INPUT_GAIN`, ou monter les seuils du gate |
 | Son « granuleux » à bas volume | Quantification 8 bits du DAC à trop faible amplitude | Diviseur résistif en sortie + augmenter `OUTPUT_LEVEL` |
-| Aigus stridents | Tone trop haut | `T:0.25` à `T:0.45` |
+| Aigus stridents | Tone trop haut | baissez `T` (0.2 à 0.4) |
 | Craquements en changeant un réglage | (déjà traité : lissage ~60 ms) | Vérifier que vous utilisez bien ce code |
 | Le gate coupe les notes tenues | Seuils trop hauts | Baisser `GATE_LOW` / `GATE_HIGH` dans `PedaleEsclave.ino` |
 | Le gate laisse passer du souffle | Seuils trop bas | Monter `GATE_LOW` / `GATE_HIGH` |
