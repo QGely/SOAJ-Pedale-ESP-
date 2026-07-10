@@ -60,20 +60,23 @@
 typedef struct __attribute__((packed)) {
   uint32_t magic;
   float    gain;      // 0.0 .. 1.0  position du pot DRIVE (gain ampli x51..x501)
-  float    clip;      // 0.50 .. 0.95 hauteur des rails d'écrêtage
+  float    clip;      // 0.50 .. 0.95 seuil d'écrêtage effectif (module les diodes)
   float    tone;      // 0.0 .. 1.0  position du pot TONE (0 = sombre, 1 = brillant)
   float    volume;    // 0.0 .. 1.0  position du pot VOLUME
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
+  uint8_t  diode;     // 0 = sans (rails ±12 V seuls), 1 = silicium ±0,6 V,
+                      // 2 = LED ±1,7 V, 3 = germanium ±0,3 V
 } PedalParams;
 
-// Valeurs de départ : potentiomètres à mi-course, comme sur le schéma
+// Valeurs de départ : potentiomètres à mi-course, diodes silicium
 static PedalParams params = {
   PARAMS_MAGIC,
   0.5f,    // drive
-  0.90f,   // clip (rails presque pleins)
+  0.85f,   // clip
   0.5f,    // tone
   0.5f,    // volume
-  1        // effet ON
+  1,       // effet ON
+  1        // diodes silicium
 };
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -102,8 +105,8 @@ static void sendParamsEspNow() {
 static void notifyStatus() {
   if (pTxChar == nullptr) return;
   char buf[80];
-  snprintf(buf, sizeof(buf), "G:%.2f;C:%.2f;T:%.2f;V:%.3f;E:%d",
-           params.gain, params.clip, params.tone, params.volume, params.effectOn);
+  snprintf(buf, sizeof(buf), "G:%.2f;C:%.2f;T:%.2f;V:%.3f;E:%d;D:%d",
+           params.gain, params.clip, params.tone, params.volume, params.effectOn, params.diode);
   pTxChar->setValue((uint8_t *)buf, strlen(buf));
   pTxChar->notify();
 }
@@ -111,13 +114,15 @@ static void notifyStatus() {
 // ---------------------------------------------------------------------------
 // Analyse des commandes du téléphone
 // ---------------------------------------------------------------------------
-// Format texte simple, insensible à la casse, séparateurs ';' ',' ou espace :
-//   G:2.5   -> gain
-//   C:0.85  -> clip (seuil de saturation)
-//   T:0.35  -> tone
-//   V:0.12  -> volume
+// Format texte simple, insensible à la casse, séparateurs ';' ',' ou espace.
+// G, T, V = positions de potentiomètre 0.0 à 1.0 :
+//   G:0.5   -> drive (pot R5+R6 : gain x51 à x501)
+//   C:0.85  -> seuil d'écrêtage (0.5 à 0.95, plus bas = écrase plus tôt)
+//   T:0.5   -> tone (pot R8+R9 : 0 = sombre, 1 = brillant)
+//   V:0.5   -> volume (pot R10+R11)
 //   E:1     -> effet ON / E:0 -> bypass
-// Exemple complet : "G:2.5;C:0.85;T:0.35;V:0.12;E:1"
+//   D:1     -> diodes : 0 = sans, 1 = silicium, 2 = LED, 3 = germanium
+// Exemple complet : "G:0.8;C:0.85;T:0.4;V:0.6;E:1;D:1"
 // ---------------------------------------------------------------------------
 static void parseCommand(const String &cmd) {
   int i = 0;
@@ -145,14 +150,15 @@ static void parseCommand(const String &cmd) {
       case 'T': params.tone   = clampf(v, TONE_MIN, TONE_MAX);       changed = true; break;
       case 'V': params.volume = clampf(v, VOLUME_MIN, VOLUME_MAX);   changed = true; break;
       case 'E': params.effectOn = (v >= 0.5f) ? 1 : 0;               changed = true; break;
+      case 'D': params.diode  = (uint8_t)clampf(v, 0.0f, 3.0f);      changed = true; break;
       default:  break;  // clé inconnue -> ignore
     }
   }
 
   if (changed) {
     paramsDirty = true;
-    Serial.printf("[BLE] Nouveaux paramètres : G=%.2f C=%.2f T=%.2f V=%.3f E=%d\n",
-                  params.gain, params.clip, params.tone, params.volume, params.effectOn);
+    Serial.printf("[BLE] Nouveaux paramètres : G=%.2f C=%.2f T=%.2f V=%.3f E=%d D=%d\n",
+                  params.gain, params.clip, params.tone, params.volume, params.effectOn, params.diode);
   }
 }
 
@@ -233,7 +239,7 @@ void setup() {
   pAdvertising->start();
 
   Serial.printf("[BLE] Publicité démarrée : \"%s\"\n", BLE_DEVICE_NAME);
-  Serial.println("Format des commandes : G:0.5;C:0.90;T:0.5;V:0.5;E:1 (pots 0.0 a 1.0)");
+  Serial.println("Format : G:0.5;C:0.85;T:0.5;V:0.5;E:1;D:1 (pots 0..1 ; D: 0=sans 1=silicium 2=LED 3=germanium)");
 }
 
 // ---------------------------------------------------------------------------

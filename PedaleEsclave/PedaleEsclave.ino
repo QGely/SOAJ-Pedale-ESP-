@@ -14,17 +14,18 @@
  *  Chaîne de traitement (dans l'ordre) :
  *    1.  Lecture ADC 12 bits sur GPIO34.
  *    2.  Suivi et suppression de l'offset DC (moyenne glissante lente).
- *    3.  Filtre passe-haut ~80 Hz (retire résidu DC et basses parasites).
+ *    3.  Filtre passe-haut ~40 Hz (retire résidu DC et basses parasites).
  *    4.  Filtre passe-bas ~5 kHz AVANT saturation (réduit le bruit ADC).
  *    5.  Noise gate PROGRESSIF (suiveur d'enveloppe + gain lissé :
  *        pas de coupure brutale, silence total sans guitare).
  *    6.  Étage de saturation = émulation du circuit ADTL082 (schéma LTspice) :
  *        gain x51..x501 (pot DRIVE R5+R6), shelf C5/R7 (graves non amplifiés),
  *        passe-bas C4 en contre-réaction.
- *    7.  Écrêtage aux rails ±12 V (tanh) : crêtes aplaties, vraie saturation.
+ *    7.  Écrêtage aux rails ±12 V (tanh) PUIS diodes d'écrêtage (paramètre D :
+ *        silicium ±0,6 V, LED ±1,7 V, germanium ±0,3 V) : crêtes aplaties.
  *    8.  Tone = pot R8+R9 + C7 : passe-bas variable APRÈS saturation.
  *    9.  Lissage de TOUS les paramètres reçus (pas de craquement).
- *    10. Volume très réduit + facteur global OUTPUT_LEVEL.
+ *    10. Volume (pot R10+R11) x amplitude DAC maximale OUTPUT_LEVEL.
  *    11. Écriture DAC 8 bits centrée sur 128 (+ mise en forme du bruit
  *        de quantification pour rester propre à bas volume).
  *
@@ -87,6 +88,16 @@
 #define RAIL_NORM           7.27f      // ±12 V exprimés en unités ADC (±1,65 V)
 #define BYPASS_GAIN         8.0f       // rattrapage de niveau quand l'effet est coupé
 
+// --- Diodes d'écrêtage (paramètre D) ----------------------------------------
+// Deuxième étage de saturation, bien plus agressif que les rails : une paire
+// de diodes tête-bêche vers la masse écrase le signal à ±Vf (tension de seuil).
+// Le signal sort de l'ampli op jusqu'à ±12 V et vient s'écraser sur ±0,6 V :
+// c'est ~20x plus de saturation que les rails seuls.
+// Seuils exprimés en unités normalisées (±1 = ±1,65 V) :
+#define VDIODE_SILICIUM     0.364f     // 2 x 1N4148, ±0,6 V  -> saturation forte
+#define VDIODE_LED          1.030f     // 2 x LED,    ±1,7 V  -> crunch plus ouvert
+#define VDIODE_GERMANIUM    0.182f     // 2 x germanium, ±0,3 V -> fuzz compressé
+
 // --- Tone : potentiomètre R8+R9 (10 kΩ) + C7 (22 nF) -----------------------
 // Passe-bas variable : T=1 -> brillant (~14 kHz), T=0.5 -> ~1,4 kHz (comme le
 // schéma avec R8=R9=5k), T=0 -> sombre (~760 Hz).
@@ -147,16 +158,18 @@ typedef struct __attribute__((packed)) {
   float    tone;
   float    volume;
   uint8_t  effectOn;
+  uint8_t  diode;     // 0 = sans (rails seuls), 1 = silicium, 2 = LED, 3 = germanium
 } PedalParams;
 
 // Cibles reçues par radio (écrites par le callback ESP-NOW, lues par l'audio)
 // Défauts = potentiomètres à mi-course, comme sur le schéma (R5=R6 -> drive
 // à 0.5 serait 275k ; on part à 0.5 ; R8=R9 -> tone 0.5 ; R10=R11 -> vol 0.5)
 static volatile float tgtGain   = 0.5f;   // position du pot DRIVE (0..1)
-static volatile float tgtClip   = 0.90f;  // hauteur des rails (0.5..0.95)
+static volatile float tgtClip   = 0.85f;  // seuil d'écrêtage (0.5..0.95)
 static volatile float tgtTone   = 0.5f;   // position du pot TONE (0..1)
 static volatile float tgtVolume = 0.5f;   // position du pot VOLUME (0..1)
 static volatile float tgtEffect = 1.0f;   // 1 = effet, 0 = bypass (fondu doux)
+static volatile float tgtVd     = VDIODE_SILICIUM;  // seuil des diodes (D=1 par défaut)
 
 // ---------------------------------------------------------------------------
 // État du traitement audio
@@ -173,10 +186,11 @@ static float quantErr  = 0.0f;                    // mise en forme du bruit DAC
 
 // Paramètres lissés (valeurs effectives utilisées par l'audio)
 static float smGain    = 0.5f;
-static float smClip    = 0.90f;
+static float smClip    = 0.85f;
 static float smTone    = 0.5f;
 static float smVolume  = 0.0f;     // démarre à 0 : montée en douceur, pas de "pop"
 static float smEffect  = 1.0f;
+static float smVd      = VDIODE_SILICIUM;  // seuil de diode lissé (change sans "pop")
 
 // Coefficients calculés au setup()
 static float hpfA        = 0.0f;
@@ -226,6 +240,12 @@ static void applyParams(const PedalParams *p) {
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
   tgtEffect = p->effectOn ? 1.0f : 0.0f;
+  switch (p->diode) {
+    case 0:  tgtVd = RAIL_NORM;         break;   // sans diodes : rails seuls
+    case 2:  tgtVd = VDIODE_LED;        break;
+    case 3:  tgtVd = VDIODE_GERMANIUM;  break;
+    default: tgtVd = VDIODE_SILICIUM;   break;   // 1 (et valeurs inconnues)
+  }
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -260,10 +280,10 @@ static inline void meterTick(float raw) {
                     "(verifiez jack, condensateur C1 et pont diviseur)\n", mPeakIn);
     } else {
       Serial.printf("[Metre] entree: %.0f pas ADC | enveloppe: %.3f | gate: %s (%.2f) | "
-                    "sortie DAC: +/-%d pas | G=%.2f V=%.3f E=%.0f\n",
+                    "sortie DAC: +/-%d pas | G=%.2f V=%.3f E=%.0f Vd=%.2f\n",
                     mPeakIn, envelope,
                     (gateGain > 0.5f) ? "OUVERT" : "ferme", gateGain,
-                    mPeakOut, smGain, smVolume, smEffect);
+                    mPeakOut, smGain, smVolume, smEffect, smVd);
     }
     mPeakIn  = 0.0f;
     mPeakOut = 0;
@@ -282,6 +302,7 @@ static inline void processSample() {
   smTone   += PARAM_SMOOTH * (tgtTone   - smTone);
   smVolume += PARAM_SMOOTH * (tgtVolume - smVolume);
   smEffect += PARAM_SMOOTH * (tgtEffect - smEffect);
+  smVd     += PARAM_SMOOTH * (tgtVd     - smVd);
 
   // ---- 1. Lecture ADC --------------------------------------------------
   const int raw = readGuitarAdc();
@@ -342,13 +363,20 @@ static inline void processSample() {
   lpC4 += (DT_SEC / (rc4 + DT_SEC)) * (amp - lpC4);
   amp = lpC4;
 
-  // ---- 7. Écrêtage aux rails ±12 V : les crêtes sont aplaties -------------
-  // Le paramètre C abaisse virtuellement les rails (C=0.95 -> presque ±12 V).
+  // ---- 7a. Écrêtage aux rails ±12 V de l'ampli op --------------------------
   // tanh donne le même aplatissement qu'un ampli op poussé aux rails, sans
   // les harmoniques d'aliasing d'un écrêtage numérique dur.
-  const float rail = RAIL_NORM * smClip;
-  float sat = rail * tanhf(amp / rail);
-  sat *= (1.0f / RAIL_NORM);          // renormalise : pleins rails -> ±1
+  float sat = RAIL_NORM * tanhf(amp / RAIL_NORM);
+
+  // ---- 7b. Diodes d'écrêtage (paramètre D) ---------------------------------
+  // Le signal (jusqu'à ±12 V) vient s'écraser sur le seuil des diodes
+  // (±0,6 V en silicium) : c'est là que se fait le gros de la saturation.
+  // Le paramètre C module le seuil effectif (plus bas = écrase plus tôt).
+  // En mode D=0 le "seuil" est RAIL_NORM : on retrouve les rails seuls.
+  const float vdEff = smVd * smClip;
+  sat = vdEff * tanhf(sat / vdEff);
+  sat *= (1.0f / vdEff);              // renormalise : écrêtage plein -> ±1
+                                      // (le volume perçu ne dépend pas de D/C)
 
   // ---- 8. Tone : pot R8+R9 + C7, passe-bas variable après saturation ------
   const float rTone = TONE_R_MIN_OHMS + (1.0f - smTone) * (TONE_R_MAX_OHMS - TONE_R_MIN_OHMS);

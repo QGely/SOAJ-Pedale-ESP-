@@ -102,9 +102,21 @@ Tout est fait pour un son **propre, doux et silencieux au repos** :
    - réseau C5 220n / R7 1k : le plein gain ne s'applique qu'au-dessus de ~723 Hz
      (graves propres, médiums/aigus qui saturent — le caractère du circuit) ;
    - C4 100p en contre-réaction : passe-bas 3,2 à 32 kHz selon le drive.
-7. **Écrêtage aux rails ±12 V** (`tanh`, sans aliasing numérique) : le signal amplifié
-   ×51..×501 vient s'aplatir sur les rails — c'est ça, la saturation. Le paramètre `C`
-   abaisse virtuellement les rails (plus bas = écrase plus tôt).
+7. **Écrêtage à deux étages** (`tanh`, sans aliasing numérique) :
+   - d'abord les **rails ±12 V** de l'ampli op ;
+   - puis les **diodes d'écrêtage** (paramètre `D`) : le signal amplifié jusqu'à
+     ±12 V vient s'écraser sur le seuil des diodes — c'est là que se fait le gros
+     de la saturation (~20× plus agressif que les rails seuls en silicium).
+
+   | `D` | Diodes | Seuil | Caractère |
+   |---|---|---|---|
+   | 0 | aucune | rails ±12 V | boost léger, presque clean |
+   | **1** | silicium (2×1N4148) | ±0,6 V | **saturation forte (défaut)** |
+   | 2 | LED | ±1,7 V | crunch plus ouvert |
+   | 3 | germanium | ±0,3 V | fuzz très compressé |
+
+   Le paramètre `C` module le seuil effectif (plus bas = écrase plus tôt), et le
+   volume perçu ne change pas quand on change `D` ou `C` (renormalisation).
 8. **Tone = potentiomètre R8+R9 (10k) + C7 (22n)** = paramètre `T` : passe-bas
    variable ~760 Hz (T=0, sombre) à ~14 kHz (T=1, brillant) ; T=0.5 ≈ 1,45 kHz
    comme le schéma (R8=R9=5k).
@@ -125,10 +137,11 @@ défaut correspondent aux potentiomètres à mi-course, comme sur le schéma.
 | Paramètre | Valeur par défaut | Plage autorisée |
 |---|---|---|
 | drive (G) | 0.5 (gain ×276) | 0.0 – 1.0 (×51 à ×501) |
-| clip (C) | 0.85 (rails presque pleins) | 0.50 – 0.95 |
+| clip (C) | 0.85 | 0.50 – 0.95 |
 | tone (T) | 0.5 (≈1,45 kHz) | 0.0 – 1.0 |
 | volume (V) | 0.5 | 0.0 – 1.0 |
 | effet (E) | 1 (ON) | 0 / 1 |
+| diodes (D) | 1 (silicium) | 0 = sans, 1 = silicium, 2 = LED, 3 = germanium |
 | `INPUT_GAIN` | 2.0 (micro simple bobinage) | constante — 1.0 = fidèle au circuit, 3–4 si signal faible |
 | `OUTPUT_LEVEL` | 0.45 (amplitude DAC max à V=1) | constante — ne pas descendre sous ~0.10 (inaudible) |
 | `DEBUG_METER` | 1 (vu-mètre série ON) | constante — mettre 0 pour jouer sans micro-coupures |
@@ -171,11 +184,12 @@ Chaque valeur est une position de potentiomètre entre 0.0 et 1.0 :
 
 ```
 G:0.5        → drive (pot R5+R6 : gain ×51 à ×501)
-C:0.85       → hauteur des rails d'écrêtage (0.5 à 0.95)
+C:0.85       → seuil d'écrêtage (0.5 à 0.95, plus bas = écrase plus tôt)
 T:0.5        → tone (pot R8+R9 : 0 = sombre, 1 = brillant)
 V:0.5        → volume (pot R10+R11)
 E:1  /  E:0  → effet ON / bypass
-G:0.8;T:0.4;V:0.6;E:1    → tout en une commande
+D:1          → diodes : 0 = sans, 1 = silicium, 2 = LED, 3 = germanium
+G:0.8;T:0.4;V:0.6;E:1;D:1    → tout en une commande
 ```
 
 Toute valeur hors plage est automatiquement ramenée dans les bornes (côté maître **et**
