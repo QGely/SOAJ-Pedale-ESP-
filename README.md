@@ -3,28 +3,32 @@
 Pédale de saturation numérique contrôlée sans fil :
 
 ```
-Téléphone ──(Bluetooth BLE)──> ESP32 MAÎTRE ──(ESP-NOW / WiFi)──> ESP32 ESCLAVE ──> Ampli
-                                                                       ▲
-                                                              Guitare (jack, ADC)
+Téléphone ──(WiFi + page web)──> ESP32 MAÎTRE ──(ESP-NOW)──> ESP32 ESCLAVE ──> Ampli
+             http://192.168.4.1                                    ▲
+                                                          Guitare (jack, ADC)
 ```
 
-- **Seuls les paramètres** (gain, clip, tone, volume, ON/OFF) transitent par radio : **jamais l'audio**.
+- Le maître crée son **propre réseau WiFi** (`SOAJ-Pedale`) et sert une **page web avec
+  des jauges** : aucun routeur, aucune appli à installer.
+- **Seuls les paramètres** (gain, clip, tone, volume, ON/OFF, diodes) transitent par
+  radio : **jamais l'audio**.
 - L'audio est traité **localement** dans l'esclave, échantillon par échantillon (20 kHz), en flottant.
 - Sans guitare en entrée : **silence total** (noise gate progressif + DAC au repos à 128).
 
-> Note : le lien maître → esclave utilise **ESP-NOW (WiFi)** et non le BLE, conformément au
-> schéma d'architecture (cellule WiFi entre pédales). C'est aussi pour cela que l'entrée
-> guitare est sur **GPIO34 (ADC1)** : l'ADC2 est inutilisable quand le WiFi est actif.
+> Note : le lien maître → esclave utilise **ESP-NOW** sur le même canal WiFi que le
+> point d'accès. C'est aussi pour cela que l'entrée guitare est sur **GPIO34 (ADC1)** :
+> l'ADC2 est inutilisable quand le WiFi est actif.
 
 ## Contenu du dépôt
 
 | Dossier | Carte | Rôle |
 |---|---|---|
-| `PedaleMaitre/` | ESP32 n°1 | Reçoit les réglages du téléphone (BLE), les diffuse en ESP-NOW |
+| `PedaleMaitre/` | ESP32 n°1 | Point d'accès WiFi + page web de réglage, diffuse en ESP-NOW |
 | `PedaleEsclave/` | ESP32 n°N | Reçoit les paramètres, traite l'audio guitare, sortie DAC |
 
 Compiler avec l'Arduino IDE, carte **« ESP32 Dev Module »** (cartes ELEGOO ESP32 CP2102).
-Aucune bibliothèque externe : tout est inclus dans le core ESP32 (BLE, WiFi, ESP-NOW).
+Aucune bibliothèque externe : tout est inclus dans le core ESP32 (WiFi, WebServer,
+DNSServer, ESP-NOW).
 
 ---
 
@@ -166,38 +170,65 @@ jouant = seuils de gate trop hauts ; `sortie DAC: +/-0` = volume à zéro ou eff
 
 ---
 
-## Protocole de contrôle
+## Contrôle depuis le téléphone (WiFi + page web)
 
-### Téléphone → Maître (BLE)
+### Connexion — 3 étapes, aucune appli à installer
 
-Le maître s'annonce sous le nom **`SOAJ-Pedale`** avec un service type *Nordic UART* :
+1. Alimentez le maître. Il crée le réseau WiFi **`SOAJ-Pedale`**
+   (mot de passe : **`soaj1234`**, modifiable en tête de `PedaleMaitre.ino`).
+2. Sur le téléphone : **Réglages → WiFi → SOAJ-Pedale**.
+3. La page de contrôle **s'ouvre toute seule** (portail captif). Sinon, ouvrez un
+   navigateur sur **`http://192.168.4.1`**.
 
-- Service : `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
-- Écriture (téléphone → pédale) : `6e400002-…`
-- Notification (pédale → téléphone, état courant) : `6e400003-…`
+> Le téléphone peut afficher « Pas de connexion Internet » : c'est normal, la pédale
+> n'est pas un routeur. Restez connecté quand même (iOS : « Utiliser sans Internet »).
 
-Compatible avec **nRF Connect**, **Serial Bluetooth Terminal** (mode BLE) ou votre propre
-appli iOS/Android/Harmony.
+### La page de contrôle
 
-Commandes texte (UTF-8), une ou plusieurs à la fois, séparées par `;`.
-Chaque valeur est une position de potentiomètre entre 0.0 et 1.0 :
+- **4 jauges** : Drive (gain ×51 à ×501), Clip (seuil d'écrêtage), Tone (sombre →
+  brillant), Volume — chaque geste est envoyé à la pédale en ~120 ms.
+- **4 boutons diodes** : sans / silicium / LED / germanium.
+- **Footswitch** ON / bypass.
+- **Voyant de liaison** en haut à droite : vert = pédale jointe, rouge = hors ligne.
+  La page relit l'état réel toutes les 3 s (plusieurs téléphones peuvent être
+  connectés en même temps, ils restent synchronisés).
+
+### API HTTP (pour votre propre appli ou des scripts)
 
 ```
-G:0.5        → drive (pot R5+R6 : gain ×51 à ×501)
-C:0.85       → seuil d'écrêtage (0.5 à 0.95, plus bas = écrase plus tôt)
-T:0.5        → tone (pot R8+R9 : 0 = sombre, 1 = brillant)
-V:0.5        → volume (pot R10+R11)
-E:1  /  E:0  → effet ON / bypass
-D:1          → diodes : 0 = sans, 1 = silicium, 2 = LED, 3 = germanium
-G:0.8;T:0.4;V:0.6;E:1;D:1    → tout en une commande
+GET http://192.168.4.1/api/get
+    → {"g":0.50,"c":0.85,"t":0.50,"v":0.50,"e":1,"d":1}
+
+GET http://192.168.4.1/api/set?g=0.8&t=0.4&v=0.6&e=1&d=1
+    → chaque argument est optionnel ; répond avec l'état complet
 ```
+
+| Clé | Rôle | Plage |
+|---|---|---|
+| `g` | drive (pot R5+R6 : gain ×51 à ×501) | 0.0 – 1.0 |
+| `c` | seuil d'écrêtage (plus bas = écrase plus tôt) | 0.5 – 0.95 |
+| `t` | tone (pot R8+R9 : 0 = sombre, 1 = brillant) | 0.0 – 1.0 |
+| `v` | volume (pot R10+R11) | 0.0 – 1.0 |
+| `e` | effet ON / bypass | 0 / 1 |
+| `d` | diodes : 0 = sans, 1 = silicium, 2 = LED, 3 = germanium | 0 – 3 |
 
 Toute valeur hors plage est automatiquement ramenée dans les bornes (côté maître **et**
-côté esclave). Après chaque commande, le maître notifie l'état complet au téléphone.
+côté esclave).
+
+### Dépannage / secours : le port série du maître
+
+Le moniteur série du maître (115200 baud) accepte les mêmes commandes qu'avant :
+
+```
+G:0.8;C:0.85;T:0.4;V:0.6;E:1;D:1
+```
+
+(taper la ligne puis Entrée — pratique pour tester sans téléphone).
 
 ### Maître → Esclave (ESP-NOW)
 
-Paquet binaire de 21 octets (`magic "SOAJ"` + 4 floats + 1 octet ON/OFF), diffusé en
+Paquet binaire de 22 octets (`magic "SOAJ"` + 4 floats + 1 octet ON/OFF + 1 octet diodes),
+diffusé en
 broadcast sur le **canal WiFi 1**, renvoyé toutes les 300 ms (un esclave allumé après le
 maître récupère donc les réglages en moins d'une seconde). Les paquets sans le bon
 `magic` sont ignorés. Plusieurs esclaves peuvent écouter le même broadcast.
@@ -238,4 +269,4 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 
 - Jamais de tension négative ni > 3,3 V sur GPIO34 (toujours passer par C1 + pont diviseur).
 - Ne pas déplacer l'entrée guitare sur un pin ADC2 : l'ADC2 ne fonctionne pas avec le WiFi.
-- Ne jamais envoyer d'audio par BLE/WiFi : uniquement les paramètres.
+- Ne jamais envoyer d'audio par WiFi : uniquement les paramètres.
