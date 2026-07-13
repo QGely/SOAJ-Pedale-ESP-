@@ -63,6 +63,9 @@
 // Volume maximal avant saturation DAC
 #define OUTPUT_LEVEL        0.45f
 
+// Bypass : rattrapage de niveau quand l'effet est coupé
+#define BYPASS_GAIN         8.0f
+
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
 
