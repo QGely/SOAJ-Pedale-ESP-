@@ -93,8 +93,14 @@
 
 // Vu-mètre de diagnostic (1 = affiche chaque seconde sur port série)
 // ATTENTION : bloque l'audio ~10 ms par seconde -> craquement périodique.
-// Laisser à 0 pour JOUER.
-#define DEBUG_METER         0
+// ACTIVÉ pendant la mise au point — remettre à 0 quand tout fonctionne.
+#define DEBUG_METER         1
+
+// Bip de test au démarrage : 2 bips de 440 Hz envoyés DIRECTEMENT au DAC,
+// sans passer par l'ADC ni par la formule. Si vous n'entendez PAS les bips,
+// le problème est entre le GPIO25 et l'ampli (câblage, condensateur de
+// liaison, volume ampli), pas dans le traitement. Mettre à 0 pour désactiver.
+#define STARTUP_TEST_TONE   1
 
 // Bornes de sécurité des paramètres
 #define GAIN_MIN            0.0f
@@ -285,15 +291,43 @@ static inline void meterTick(float raw) {
   if (dev > mPeakIn) mPeakIn = dev;
 
   if (++mCount >= (uint32_t)SAMPLE_RATE_HZ) {
-    const float g = driveTaper(smGain);
-    Serial.printf("[Metre] entree: %.0f pas ADC | sortie DAC: +/-%d pas | "
-                  "G=%.2f (g=%.3f, gain max ~x%.0f) T=%.2f V=%.3f E=%.0f\n",
-                  mPeakIn, mPeakOut, smGain, g, 1.0f + 500.0f * g,
-                  smTone, smVolume, smEffect);
+    if (mPeakIn < 6.0f) {
+      Serial.printf("[Metre] entree crete: %.0f pas ADC — PAS DE SIGNAL GUITARE "
+                    "(verifiez jack, condensateur de liaison et pont diviseur)\n",
+                    mPeakIn);
+    } else if (mPeakOut < 2) {
+      const float g = driveTaper(smGain);
+      Serial.printf("[Metre] entree: %.0f pas ADC mais sortie DAC ~0 — signal "
+                    "PERDU dans le traitement (G=%.2f g=%.3f T=%.2f V=%.3f E=%.0f)\n",
+                    mPeakIn, smGain, g, smTone, smVolume, smEffect);
+    } else {
+      const float g = driveTaper(smGain);
+      Serial.printf("[Metre] entree: %.0f pas ADC | sortie DAC: +/-%d pas | "
+                    "G=%.2f (g=%.3f, gain max ~x%.0f) T=%.2f V=%.3f E=%.0f\n",
+                    mPeakIn, mPeakOut, smGain, g, 1.0f + 500.0f * g,
+                    smTone, smVolume, smEffect);
+    }
     mPeakIn  = 0.0f;
     mPeakOut = 0;
     mCount   = 0;
   }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Bip de test : sinus envoyé directement au DAC (ne passe ni par l'ADC,
+// ni par la formule). Sert à valider le chemin GPIO25 -> ampli.
+// ---------------------------------------------------------------------------
+#if STARTUP_TEST_TONE
+static void playTestTone(float freqHz, float durSec, float amp) {
+  const uint32_t n = (uint32_t)(durSec * (float)SAMPLE_RATE_HZ);
+  const float    w = 2.0f * (float)M_PI * freqHz / (float)SAMPLE_RATE_HZ;
+  for (uint32_t i = 0; i < n; i++) {
+    const float s = amp * sinf(w * (float)i);
+    dacWrite(PIN_AUDIO_OUT, (uint8_t)lroundf(128.0f + s * 127.0f));
+    delayMicroseconds(SAMPLE_PERIOD_US - 12);   // ~12 µs déjà consommés
+  }
+  dacWrite(PIN_AUDIO_OUT, 128);
 }
 #endif
 
@@ -358,7 +392,7 @@ static inline void processSample() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ Pédale — ESCLAVE (formule H(s,g,t,v), linéaire) ===");
+  Serial.println("\n=== SOAJ Pédale — ESCLAVE v3-diagnostic (formule H(s,g,t,v), linéaire) ===");
 
   // --- ADC ---
 #ifdef USE_LEGACY_ADC
@@ -404,6 +438,16 @@ void setup() {
   if (dcOffset < 1200.0f || dcOffset > 2900.0f) {
     Serial.println("ATTENTION : offset DC anormal — vérifiez le pont diviseur");
   }
+
+#if STARTUP_TEST_TONE
+  // Deux bips de 440 Hz directement sur le DAC : si vous ne les entendez pas
+  // dans l'ampli, le problème est le câblage de sortie, pas le traitement.
+  Serial.println("[Test] BIP 440 Hz x2 sur le DAC (test du chemin de sortie)...");
+  playTestTone(440.0f, 0.35f, 0.6f);
+  delay(150);
+  playTestTone(440.0f, 0.35f, 0.6f);
+  Serial.println("[Test] Bips terminés. Si rien entendu : vérifier GPIO25 -> ampli.");
+#endif
 
   nextSampleUs = micros();
 }
