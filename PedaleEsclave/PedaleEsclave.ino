@@ -5,20 +5,28 @@
  * ============================================================================
  *
  *  Rôle :
- *    - Reçoit UNIQUEMENT des paramètres (gain, clip, tone, volume, ON/OFF)
+ *    - Reçoit UNIQUEMENT des paramètres (gain, tone, volume, ON/OFF)
  *      du maître via ESP-NOW. Aucun audio ne transite par radio.
  *    - Lit la guitare sur l'ADC (GPIO34, ADC1 : compatible WiFi/ESP-NOW).
- *    - Traite le signal localement en appliquant H(s,g,t,v) mathématiquement.
+ *    - Applique la fonction de transfert H(s,g,t,v) du circuit TL082
+ *      (réponse LINÉAIRE pure, pas de saturation numérique ajoutée).
  *    - Sort le signal traité sur le DAC interne (GPIO25), centré sur 128.
  *
- *  Chaîne de traitement (formule mathématique pure) :
+ *  Formule implémentée (voir README) :
  *    H(s,g,t,v) = Hin(s) × Hampli(s,g) × Hsortie(s,t,v)
  *
- *    Hin(s)      : filtre passe-haut d'entrée ~0.335 Hz (quasi no-op)
- *    Hampli(s,g) : amplificateur réglable, gain exponentiel x2 → x500
- *    Hsortie(s,t,v) : filtre passe-bas de tonalité + volume
+ *    Hin(s)      = 0.47·s / (1 + 0.4747·s)
+ *                  (liaison d'entrée R4/C3/R3 — passe-haut ~0,335 Hz)
  *
- *  Réponse linéaire uniquement, sans saturation non-linéaire.
+ *    Hampli(s,g) = 1 + (0.11·g·s) / ((1 + 5e-5·g·s)(1 + 2.2e-4·s))
+ *                  (ampli non-inverseur : R5 = g·500k, C4 100 pF, R7 1k, C5 220 nF)
+ *
+ *    Hsortie(s,t,v) = 0.1·v·s / (1 + (0.11242 − 0.00022·t)·s
+ *                                  + (2.42e-5·t − 2.2e-6·t²)·s²)
+ *                  (tone R8/R9 10k + C7 22 nF, liaison C6 1 µF, volume R10/R11 100k)
+ *
+ *  Chaque étage est converti en filtre numérique IIR (biquad) par
+ *  transformation bilinéaire  s = 2·fs·(1 − z⁻¹)/(1 + z⁻¹)  à 20 kHz.
  *
  *  IMPORTANT — matériel :
  *    L'entrée GPIO34 ne supporte NI tension négative NI plus de 3,3 V.
@@ -52,59 +60,46 @@
 // ---------------------------------------------------------------------------
 #define SAMPLE_RATE_HZ      20000     // 20 kHz
 #define SAMPLE_PERIOD_US    (1000000UL / SAMPLE_RATE_HZ)
+#define DT_SEC              (1.0f / (float)SAMPLE_RATE_HZ)
 
-// Amplification d'entrée logicielle
+// Amplification d'entrée logicielle (1.0 = strictement fidèle au circuit)
 #define INPUT_GAIN          2.0f
 
-// Gain exponentiel du drive : G ∈ [0,1] → gain ∈ [DRIVE_GAIN_MIN, DRIVE_GAIN_MAX]
-#define DRIVE_GAIN_MIN      2.0f       // G=0 : quasi clean
-#define DRIVE_GAIN_MAX      500.0f     // G=1 : heavy metal
-
-// Volume maximal avant saturation DAC
-#define OUTPUT_LEVEL        0.45f
+// Niveau de sortie global (1.0 = fidèle à la formule ; baisser si ça sature
+// trop fort le DAC — la formule peut donner un gain de plusieurs centaines)
+#define OUTPUT_LEVEL        1.0f
 
 // Bypass : rattrapage de niveau quand l'effet est coupé
 #define BYPASS_GAIN         8.0f
 
+// Course du potentiomètre DRIVE :
+//   1 = course logarithmique (pot "audio") : le bouton est progressif,
+//       g réel = (e^(p·ln501) − 1)/500 -> p=0.5 donne g≈0.043 (gain ~×20)
+//   0 = course linéaire, strictement fidèle au schéma (R5 = p·500k) —
+//       attention : dès p=0.1 le gain dépasse ×50, tout le haut de la
+//       course sature le DAC de la même façon
+#define DRIVE_TAPER_LOG     1
+
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
+
+// Recalcul des coefficients de filtres tous les N échantillons (~3 ms) :
+// assez fréquent pour suivre le lissage, assez rare pour tenir les 50 µs
+// du cycle audio (le recalcul contient des divisions coûteuses)
+#define COEF_UPDATE_SAMPLES 64
 
 // Suivi de l'offset DC (très lent, ~100 ms)
 #define DC_TRACK_COEF       0.0005f
 
 // Vu-mètre de diagnostic (1 = affiche chaque seconde sur port série)
-// ATTENTION : bloque l'audio ~10 ms par seconde → craquement périodique.
+// ATTENTION : bloque l'audio ~10 ms par seconde -> craquement périodique.
 // Laisser à 0 pour JOUER.
 #define DEBUG_METER         0
-
-// Courbe de visualisation (Python + Serial) : envoie entrée/sortie sur port série
-// pour affichage en temps réel. Laisser à 0 pour JOUER, 1 pour VISUALISER.
-#define DEBUG_PLOT          0
-#define PLOT_DECIMATION    20  // envoie 1 point tous les 20 échantillons (~1 kHz)
 
 // Bornes de sécurité des paramètres
 #define GAIN_MIN            0.0f
 #define GAIN_MAX            1.0f
-#define CLIP_MIN            0.50f     // (non utilisé en mode linéaire)
-#define CLIP_MAX            0.95f
 #define VOLUME_MAX          1.0f
-
-// Coefficients constants pour les formules mathématiques
-// Hin(s) : filtre passe-haut d'entrée
-#define HIN_NUM_COEF        0.47f     // numérateur : 0.47*s
-#define HIN_DEN_COEF        0.4747f   // dénominateur : 1 + 0.4747*s
-
-// Hampli(s,g) : amplificateur avec gain exponentiel
-// Hin à ignorer ou traiter comme no-op (fc ~0.335 Hz)
-// Hampli : 1 + (0.11*g*s) / ((1 + 5e-5*g*s)(1 + 2.2e-4*s))
-
-// Hsortie(s,t,v) : filtre passe-bas de tonalité
-// Tonalité : R = 500 + (1-t)*9000 Ω, C = 22 nF
-// Volume : gain = v
-
-#define TONE_C_FARADS       22e-9f
-#define TONE_R_MIN_OHMS     500.0f
-#define TONE_R_MAX_OHMS     9500.0f
 
 // ---------------------------------------------------------------------------
 // Paquet de paramètres (DOIT rester identique dans PedaleMaitre.ino)
@@ -114,64 +109,116 @@
 typedef struct __attribute__((packed)) {
   uint32_t magic;
   float    gain;
-  float    clip;
+  float    clip;      // ignoré en mode linéaire (gardé pour compatibilité)
   float    tone;
   float    volume;
   uint8_t  effectOn;
-  uint8_t  diode;
+  uint8_t  diode;     // ignoré en mode linéaire (gardé pour compatibilité)
 } PedalParams;
 
 // Cibles reçues par radio
 static volatile float tgtGain   = 0.5f;
-static volatile float tgtClip   = 0.85f;
 static volatile float tgtTone   = 0.5f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
 
 // ---------------------------------------------------------------------------
-// Filtres IIR 2ème ordre générique
+// Biquad IIR : y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
 // ---------------------------------------------------------------------------
-struct IIR_Filter2 {
-  float b[3], a[2];      // coefficients : y[n] = sum(b*x) - sum(a*y_prev)
-  float x[3], y[2];      // état (x[0] courant, x[1] t-1, x[2] t-2, idem y)
-};
+typedef struct {
+  float b0, b1, b2;   // coefficients du numérateur
+  float a1, a2;       // coefficients du dénominateur (a0 normalisé à 1)
+  float x1, x2;       // x[n-1], x[n-2]
+  float y1, y2;       // y[n-1], y[n-2]
+} Biquad;
 
-// Applique un filtre IIR 2ème ordre
-static inline float applyIIR2(IIR_Filter2 *f, float xn) {
-  float yn = f->b[0]*xn + f->b[1]*f->x[1] + f->b[2]*f->x[2]
-           - f->a[0]*f->y[0] - f->a[1]*f->y[1];
-  f->x[2] = f->x[1];
-  f->x[1] = xn;
-  f->y[1] = f->y[0];
-  f->y[0] = yn;
-  return yn;
+static inline float biquadRun(Biquad *f, float x) {
+  const float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
+                            - f->a1 * f->y1 - f->a2 * f->y2;
+  f->x2 = f->x1;  f->x1 = x;
+  f->y2 = f->y1;  f->y1 = y;
+  return y;
+}
+
+// Transformation bilinéaire GÉNÉRIQUE :
+//   H(s) = (n0 + n1·s + n2·s²) / (d0 + d1·s + d2·s²)
+// devient un biquad en z avec s = K·(1 − z⁻¹)/(1 + z⁻¹), K = 2·fs.
+// Ne touche PAS à l'état (x1..y2) : on peut recalculer les coefficients
+// en cours de route sans "pop".
+static void bilinear2(Biquad *f,
+                      float n0, float n1, float n2,
+                      float d0, float d1, float d2) {
+  const float K  = 2.0f * (float)SAMPLE_RATE_HZ;
+  const float K2 = K * K;
+
+  const float B0 = n0 + n1 * K + n2 * K2;
+  const float B1 = 2.0f * (n0 - n2 * K2);
+  const float B2 = n0 - n1 * K + n2 * K2;
+
+  const float A0 = d0 + d1 * K + d2 * K2;
+  const float A1 = 2.0f * (d0 - d2 * K2);
+  const float A2 = d0 - d1 * K + d2 * K2;
+
+  const float inv = 1.0f / A0;
+  f->b0 = B0 * inv;  f->b1 = B1 * inv;  f->b2 = B2 * inv;
+  f->a1 = A1 * inv;  f->a2 = A2 * inv;
+}
+
+// --- Étage 1 : Hin(s) = 0.47·s / (1 + 0.4747·s) ----------------------------
+static void calcHin(Biquad *f) {
+  bilinear2(f, 0.0f, 0.47f, 0.0f,
+               1.0f, 0.4747f, 0.0f);
+}
+
+// --- Étage 2 : Hampli(s,g) = 1 + 0.11·g·s / ((1+5e-5·g·s)(1+2.2e-4·s)) -----
+// Mise au même dénominateur :
+//   num = 1 + (τ1+τ2+0.11·g)·s + τ1·τ2·s²
+//   den = 1 + (τ1+τ2)·s        + τ1·τ2·s²
+// avec τ1 = R5·C4 = 5e-5·g  et  τ2 = R7·C5 = 2.2e-4.
+static void calcAmpli(Biquad *f, float g) {
+  const float t1 = 5e-5f * g;
+  const float t2 = 2.2e-4f;
+  const float tg = 0.11f * g;
+  bilinear2(f, 1.0f, t1 + t2 + tg, t1 * t2,
+               1.0f, t1 + t2,      t1 * t2);
+}
+
+// --- Étage 3 : Hsortie(s,t,v) -----------------------------------------------
+//   num = 0.1·v·s
+//   den = 1 + (0.11242 − 0.00022·t)·s + (2.42e-5·t − 2.2e-6·t²)·s²
+static void calcSortie(Biquad *f, float t, float v) {
+  const float d1 = 0.11242f - 0.00022f * t;
+  const float d2 = 2.42e-5f * t - 2.2e-6f * t * t;
+  bilinear2(f, 0.0f, 0.1f * v, 0.0f,
+               1.0f, d1,       d2);
+}
+
+// Course du pot DRIVE : position du bouton p (0..1) -> variable g de la formule
+static inline float driveTaper(float p) {
+#if DRIVE_TAPER_LOG
+  return (expf(p * 6.2166f) - 1.0f) / 500.0f;   // ln(501) = 6.2166
+#else
+  return p;
+#endif
 }
 
 // ---------------------------------------------------------------------------
 // État du traitement audio
 // ---------------------------------------------------------------------------
-static float dcOffset   = 2048.0f;
-static IIR_Filter2 fHin     = {0};      // filtre d'entrée (passe-haut)
-static IIR_Filter2 fAmpli   = {0};      // amplificateur avec filtrage
-static IIR_Filter2 fTone    = {0};      // filtre de tonalité
+static float dcOffset = 2048.0f;
+static Biquad fHin    = {0};
+static Biquad fAmpli  = {0};
+static Biquad fSortie = {0};
+static float  quantErr = 0.0f;       // mise en forme du bruit DAC
 
 // Paramètres lissés (valeurs effectives utilisées par l'audio)
 static float smGain    = 0.5f;
-static float smClip    = 0.85f;
 static float smTone    = 0.5f;
-static float smVolume  = 0.0f;
+static float smVolume  = 0.0f;       // démarre à 0 : montée douce, pas de "pop"
 static float smEffect  = 1.0f;
 
-// Compteur de décimation pour DEBUG_PLOT
-#if DEBUG_PLOT
-static int plotCount   = 0;
-#endif
-
-// Coefficients pré-calculés
-static float driveLogSpan = 0.0f;
-#define DT_SEC (1.0f / (float)SAMPLE_RATE_HZ)
-
-static uint32_t nextSampleUs = 0;
+static uint16_t coefCountdown = 0;   // recalcul périodique des coefficients
+static uint32_t nextSampleUs  = 0;
 
 // ---------------------------------------------------------------------------
 // Utilitaires
@@ -201,86 +248,14 @@ static inline int readGuitarAdc() {
 }
 
 // ---------------------------------------------------------------------------
-// Calcul des coefficients IIR via transformation bilinéaire
-// ---------------------------------------------------------------------------
-
-// Filtre passe-haut 1er ordre Hin(s) = 0.47*s / (1 + 0.4747*s)
-// Fréquence de coupure fc ≈ 0.335 Hz (quasi no-op en audio)
-static void calcIIR_Hin(IIR_Filter2 *f) {
-  const float fs = (float)SAMPLE_RATE_HZ;
-  const float a = 2.0f * fs;
-
-  // Coefficients bilinéaires pour passe-haut 1er ordre
-  const float rc = 1.0f / (HIN_DEN_COEF * a);
-  const float denom = 1.0f + 1.0f / (HIN_DEN_COEF * a);
-
-  f->b[0] = HIN_NUM_COEF * a / denom;
-  f->b[1] = -f->b[0];
-  f->b[2] = 0.0f;
-
-  f->a[0] = (1.0f / HIN_DEN_COEF - a) / denom;
-  f->a[1] = 0.0f;
-}
-
-// Filtre amplificateur Hampli avec gain exponentiel dépendant de g
-// Hampli(s,g) ≈ gain_exponentiel(g) avec filtrage RC
-// Simplifié : gain direct + filtre passe-bas lent pour éviter aliasing
-static void calcIIR_Ampli(IIR_Filter2 *f, float g) {
-  const float fs = (float)SAMPLE_RATE_HZ;
-
-  // Gain exponentiel : x2 (clean) → x500 (metal)
-  const float gain = DRIVE_GAIN_MIN * expf(g * driveLogSpan);
-
-  // Passe-bas pour éviter aliasing du gain : environ 3-4 kHz selon le gain
-  // Plus le gain est grand, plus on filtre haut (pour conserver l'attaque)
-  const float fc_lpf = 2000.0f + 3000.0f * (1.0f - g);  // ~2-5 kHz
-  const float wc = 2.0f * (float)M_PI * fc_lpf;
-
-  // Coefficient bilinéaire 1er ordre : passe-bas
-  const float a = 2.0f * fs;
-  const float alpha = wc / (a + wc);
-
-  // Gain en cascade avec passe-bas
-  f->b[0] = gain * alpha;
-  f->b[1] = gain * alpha;
-  f->b[2] = 0.0f;
-
-  f->a[0] = (a - wc) / (a + wc);
-  f->a[1] = 0.0f;
-}
-
-// Filtre tonalité Hsortie : passe-bas 1er ordre avec volume
-// R = 500 + (1-t)*9000, C = 22 nF
-static void calcIIR_Tone(IIR_Filter2 *f, float t, float v) {
-  const float fs = (float)SAMPLE_RATE_HZ;
-
-  // Résistance variable selon tone
-  const float rTone = TONE_R_MIN_OHMS + (1.0f - t) * (TONE_R_MAX_OHMS - TONE_R_MIN_OHMS);
-
-  // Passe-bas RC
-  const float rc = rTone * TONE_C_FARADS;
-  const float alpha = DT_SEC / (rc + DT_SEC);
-
-  // Gain volume
-  const float outLevel = v * OUTPUT_LEVEL;
-
-  f->b[0] = alpha * outLevel;
-  f->b[1] = alpha * outLevel;
-  f->b[2] = 0.0f;
-
-  f->a[0] = 1.0f - alpha;
-  f->a[1] = 0.0f;
-}
-
-// ---------------------------------------------------------------------------
 // Réception ESP-NOW
 // ---------------------------------------------------------------------------
 static void applyParams(const PedalParams *p) {
   tgtGain   = clampf(p->gain,   GAIN_MIN, GAIN_MAX);
-  tgtClip   = clampf(p->clip,   CLIP_MIN, CLIP_MAX);
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
   tgtEffect = p->effectOn ? 1.0f : 0.0f;
+  // p->clip et p->diode sont ignorés : la chaîne est purement linéaire
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -310,10 +285,10 @@ static inline void meterTick(float raw) {
   if (dev > mPeakIn) mPeakIn = dev;
 
   if (++mCount >= (uint32_t)SAMPLE_RATE_HZ) {
+    const float g = driveTaper(smGain);
     Serial.printf("[Metre] entree: %.0f pas ADC | sortie DAC: +/-%d pas | "
-                  "G=%.2f (x%.0f) T=%.2f V=%.3f E=%.0f\n",
-                  mPeakIn, mPeakOut,
-                  smGain, DRIVE_GAIN_MIN * expf(smGain * driveLogSpan),
+                  "G=%.2f (g=%.3f, gain max ~x%.0f) T=%.2f V=%.3f E=%.0f\n",
+                  mPeakIn, mPeakOut, smGain, g, 1.0f + 500.0f * g,
                   smTone, smVolume, smEffect);
     mPeakIn  = 0.0f;
     mPeakOut = 0;
@@ -323,64 +298,55 @@ static inline void meterTick(float raw) {
 #endif
 
 // ---------------------------------------------------------------------------
-// Traitement d'UN échantillon audio : H(s,g,t,v) = Hin × Hampli × Hsortie
+// Traitement d'UN échantillon : y = Hin × Hampli × Hsortie appliqué à x
 // ---------------------------------------------------------------------------
 static inline void processSample() {
   // Lissage des paramètres (progression douce, pas de craquement)
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
-  smClip   += PARAM_SMOOTH * (tgtClip   - smClip);
   smTone   += PARAM_SMOOTH * (tgtTone   - smTone);
   smVolume += PARAM_SMOOTH * (tgtVolume - smVolume);
   smEffect += PARAM_SMOOTH * (tgtEffect - smEffect);
 
-  // Recalcule les coefficients des filtres qui dépendent de g et t
-  calcIIR_Ampli(&fAmpli, smGain);
-  calcIIR_Tone(&fTone, smTone, smVolume);
+  // Recalcul périodique des coefficients (g, t, v changent lentement grâce
+  // au lissage ; recalculer chaque échantillon ne tiendrait pas dans les 50 µs)
+  if (coefCountdown == 0) {
+    coefCountdown = COEF_UPDATE_SAMPLES;
+    calcAmpli(&fAmpli, driveTaper(smGain));
+    calcSortie(&fSortie, smTone, smVolume);
+  }
+  coefCountdown--;
 
-  // --- 1. Lecture ADC ---
+  // --- Lecture ADC + suppression de l'offset DC ---
   const int raw = readGuitarAdc();
-
-  // --- 2. Suppression offset DC + normalisation ---
   dcOffset += DC_TRACK_COEF * ((float)raw - dcOffset);
-  float x = ((float)raw - dcOffset) * (INPUT_GAIN / 2048.0f);
+  const float x = ((float)raw - dcOffset) * (INPUT_GAIN / 2048.0f);
 
 #if DEBUG_METER
   meterTick((float)raw);
 #endif
 
-  // --- 3. Chaîne de filtres H(s,g,t,v) ---
-  // Hin(s) : filtre passe-haut d'entrée (presque no-op, fc ~0.335 Hz)
-  // Mais on l'applique pour fidélité mathématique complète
-  float y = applyIIR2(&fHin, x);
+  // --- La formule : trois étages en cascade ---
+  float y = biquadRun(&fHin,    x);   // Hin(s)
+  y       = biquadRun(&fAmpli,  y);   // Hampli(s,g)
+  y       = biquadRun(&fSortie, y);   // Hsortie(s,t,v)
 
-  // Hampli(s,g) : amplificateur avec gain exponentiel
-  // (déjà intégré le filtrage pour éviter aliasing)
-  y = applyIIR2(&fAmpli, y);
-
-  // Hsortie(s,t,v) : filtre passe-bas de tonalité + volume
-  y = applyIIR2(&fTone, y);
-
-  // --- 4. Bypass optionnel ---
+  // --- Bypass en fondu : mélange signal direct <-> signal traité ---
   const float dry = x * BYPASS_GAIN;
   y = dry + (y - dry) * smEffect;
 
-  // --- 5. DAC 8 bits centré sur 128 ---
-  const float desired = 128.0f + y * 127.0f;
+  // --- DAC 8 bits centré sur 128 + mise en forme du bruit ---
+  const float desired = 128.0f + y * OUTPUT_LEVEL * 127.0f + quantErr;
   int dacVal = (int)lroundf(desired);
   if (dacVal < 0)   dacVal = 0;
   if (dacVal > 255) dacVal = 255;
+  quantErr = desired - (float)dacVal;
+  // En cas d'écrêtage DAC, ne pas accumuler une erreur géante
+  if (quantErr >  1.0f) quantErr =  1.0f;
+  if (quantErr < -1.0f) quantErr = -1.0f;
 
 #if DEBUG_METER
   const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
   if (outDev > mPeakOut) mPeakOut = outDev;
-#endif
-
-#if DEBUG_PLOT
-  // Envoie entrée (x) et sortie (y) pour visualisation Python
-  if (++plotCount >= PLOT_DECIMATION) {
-    Serial.printf("%.4f,%.4f\n", x, y);
-    plotCount = 0;
-  }
 #endif
 
   dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
@@ -392,7 +358,7 @@ static inline void processSample() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ Pédale — ESCLAVE (formule mathématique pure) ===");
+  Serial.println("\n=== SOAJ Pédale — ESCLAVE (formule H(s,g,t,v), linéaire) ===");
 
   // --- ADC ---
 #ifdef USE_LEGACY_ADC
@@ -403,16 +369,13 @@ void setup() {
   analogSetPinAttenuation(PIN_GUITAR_IN, ADC_11db);
 #endif
 
-  // --- DAC ---
+  // --- DAC : sortie au repos = 128 (milieu, aucun son) ---
   dacWrite(PIN_AUDIO_OUT, 128);
 
-  // --- Coefficients pré-calculés ---
-  driveLogSpan = logf(DRIVE_GAIN_MAX / DRIVE_GAIN_MIN);
-
-  // Initialisation des filtres
-  calcIIR_Hin(&fHin);
-  calcIIR_Ampli(&fAmpli, 0.5f);
-  calcIIR_Tone(&fTone, 0.5f, 0.5f);
+  // --- Coefficients initiaux des trois étages ---
+  calcHin(&fHin);
+  calcAmpli(&fAmpli, driveTaper(smGain));
+  calcSortie(&fSortie, smTone, smVolume);
 
   // --- WiFi / ESP-NOW ---
   WiFi.mode(WIFI_STA);
@@ -428,10 +391,10 @@ void setup() {
 
   Serial.print("[WiFi] MAC esclave : ");
   Serial.println(WiFi.macAddress());
-  Serial.printf("Audio : %d Hz, H(s,g,t,v) = Hin × Hampli × Hsortie (réponse linéaire)\n",
+  Serial.printf("Audio : %d Hz — H(s,g,t,v) = Hin x Hampli x Hsortie (lineaire)\n",
                 SAMPLE_RATE_HZ);
 
-  // Stabilisation offset DC
+  // Stabilisation de l'offset DC avant de sortir du son (évite le "plop")
   for (int i = 0; i < 4000; i++) {
     const int raw = readGuitarAdc();
     dcOffset += 0.01f * ((float)raw - dcOffset);
