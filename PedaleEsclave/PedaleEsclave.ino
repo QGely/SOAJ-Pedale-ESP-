@@ -77,6 +77,11 @@
 // Laisser à 0 pour JOUER.
 #define DEBUG_METER         0
 
+// Courbe de visualisation (Python + Serial) : envoie entrée/sortie sur port série
+// pour affichage en temps réel. Laisser à 0 pour JOUER, 1 pour VISUALISER.
+#define DEBUG_PLOT          0
+#define PLOT_DECIMATION    20  // envoie 1 point tous les 20 échantillons (~1 kHz)
+
 // Bornes de sécurité des paramètres
 #define GAIN_MIN            0.0f
 #define GAIN_MAX            1.0f
@@ -156,6 +161,11 @@ static float smClip    = 0.85f;
 static float smTone    = 0.5f;
 static float smVolume  = 0.0f;
 static float smEffect  = 1.0f;
+
+// Compteur de décimation pour DEBUG_PLOT
+#if DEBUG_PLOT
+static int plotCount   = 0;
+#endif
 
 // Coefficients pré-calculés
 static float driveLogSpan = 0.0f;
@@ -363,6 +373,14 @@ static inline void processSample() {
 #if DEBUG_METER
   const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
   if (outDev > mPeakOut) mPeakOut = outDev;
+#endif
+
+#if DEBUG_PLOT
+  // Envoie entrée (x) et sortie (y) pour visualisation Python
+  if (++plotCount >= PLOT_DECIMATION) {
+    Serial.printf("%.4f,%.4f\n", x, y);
+    plotCount = 0;
+  }
 #endif
 
   dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
