@@ -8,13 +8,18 @@
  *    Téléphone --(WiFi, page web)--> ESP32 Maître --(ESP-NOW)--> Esclave(s)
  *
  *    - Crée un réseau WiFi "SOAJ-Pedale" (point d'accès, aucun routeur requis).
- *    - Sert une page web avec des jauges : drive, clip, tone, volume,
- *      ON/OFF et choix des diodes d'écrêtage.
+ *    - Sert une page web avec 7 jauges : drive, dist(saturation), low, mid,
+ *      high, tone, volume + ON/OFF.
+ *      L'esclave applique : Hin × Hampli(g) -> S(u,d) saturation ->
+ *      EQ 3 bandes (b,m,h) -> Hsortie(t,v).
  *    - Valide et borne les paramètres, puis les diffuse à l'esclave en
  *      ESP-NOW (broadcast, même canal WiFi que le point d'accès).
  *    - Renvoie périodiquement les paramètres (si l'esclave démarre après).
  *    - Bonus : accepte aussi les commandes texte sur le port série
- *      (ex : "G:0.8;T:0.4;V:0.6;D:1").
+ *      (ex : "G:0.8;D:0.5;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1").
+ *
+ *  NB : le paquet ESP-NOW a changé (7 paramètres) — re-téléverser l'ESCLAVE
+ *  en même temps que ce fichier, sinon les réglages seront ignorés.
  *
  *  Utilisation :
  *    1. Sur le téléphone : réglages WiFi -> réseau "SOAJ-Pedale",
@@ -47,8 +52,6 @@
 // circuit : G = drive (R5+R6), T = tone (R8+R9), V = volume (R10+R11).
 #define GAIN_MIN    0.0f
 #define GAIN_MAX    1.0f
-#define CLIP_MIN    0.50f
-#define CLIP_MAX    0.95f
 #define TONE_MIN    0.0f
 #define TONE_MAX    1.0f
 #define VOLUME_MIN  0.0f
@@ -61,24 +64,27 @@
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
-  float    gain;      // 0.0 .. 1.0  pot DRIVE (exponentiel : x2 clean .. x500 metal)
-  float    clip;      // 0.50 .. 0.95 dureté de l'écrêtage (bas = dur/agressif)
-  float    tone;      // 0.0 .. 1.0  position du pot TONE (0 = sombre, 1 = brillant)
-  float    volume;    // 0.0 .. 1.0  position du pot VOLUME
+  float    gain;      // g : drive (0..1)
+  float    dist;      // d : saturation (0 = aucune .. 1 = extrême)
+  float    low;       // b : graves  (0..1, 0.5 = plat, ±12 dB)
+  float    mid;       // m : médiums (0..1, 0.5 = plat, ±12 dB)
+  float    high;      // h : aigus   (0..1, 0.5 = plat, ±12 dB)
+  float    tone;      // t : tonalité (0..1)
+  float    volume;    // v : volume (0..1)
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
-  uint8_t  diode;     // 0 = sans (rails ±12 V seuls), 1 = silicium ±0,6 V,
-                      // 2 = LED ±1,7 V, 3 = germanium ±0,3 V
 } PedalParams;
 
-// Valeurs de départ : potentiomètres à mi-course, diodes silicium
+// Valeurs de départ : potentiomètres à mi-course, EQ plat, crunch léger
 static PedalParams params = {
   PARAMS_MAGIC,
   0.5f,    // drive
-  0.85f,   // clip
+  0.3f,    // dist : léger crunch
+  0.5f,    // low  (plat)
+  0.5f,    // mid  (plat)
+  0.5f,    // high (plat)
   0.5f,    // tone
   0.5f,    // volume
-  1,       // effet ON
-  1        // diodes silicium
+  1        // effet ON
 };
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -150,33 +156,38 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </style></head><body>
 <div class="pedal">
 <header>
-  <div><h1>S<b>O</b>AJ</h1><div class="sub">SATURATION &middot; ESP32</div></div>
+  <div><h1>S<b>O</b>AJ</h1><div class="sub">SATURATION + EQ 3 BANDES &middot; ESP32</div></div>
   <div class="link"><span id="lktxt">liaison</span><span class="dot" id="dot"></span></div>
 </header>
 
 <div class="card">
   <div class="ctl"><div class="row"><label for="g">Drive</label><output id="og">0.50</output></div>
     <input type="range" id="g" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">&times;2 clean &rarr; &times;30 crunch &rarr; &times;500 heavy metal</div></div>
-  <div class="ctl"><div class="row"><label for="c">Clip</label><output id="oc">0.85</output></div>
-    <input type="range" id="c" min="0.5" max="0.95" step="0.01" value="0.85">
-    <div class="hint">duret&eacute; de l'&eacute;cr&ecirc;tage &mdash; plus bas = plus dur / agressif</div></div>
+    <div class="hint">gain d'entr&eacute;e (pot R5 de la formule) &mdash; pousse l'&eacute;tage de saturation</div></div>
+  <div class="ctl"><div class="row"><label for="d">Dist</label><output id="od">0.30</output></div>
+    <input type="range" id="d" min="0" max="1" step="0.01" value="0.3">
+    <div class="hint">saturation S(u,d) &mdash; 0 = z&eacute;ro distorsion &rarr; 1 = fuzz extr&ecirc;me</div></div>
+</div>
+
+<div class="card">
+  <div class="ctl"><div class="row"><label for="b">Low</label><output id="ob">0.50</output></div>
+    <input type="range" id="b" min="0" max="1" step="0.01" value="0.5">
+    <div class="hint">graves 100 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="m">Mid</label><output id="om">0.50</output></div>
+    <input type="range" id="m" min="0" max="1" step="0.01" value="0.5">
+    <div class="hint">m&eacute;diums 700 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="h">High</label><output id="oh">0.50</output></div>
+    <input type="range" id="h" min="0" max="1" step="0.01" value="0.5">
+    <div class="hint">aigus 3,2 kHz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+</div>
+
+<div class="card">
   <div class="ctl"><div class="row"><label for="t">Tone</label><output id="ot">0.50</output></div>
     <input type="range" id="t" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">pot R8+R9 &mdash; 0 = sombre, 1 = brillant</div></div>
   <div class="ctl"><div class="row"><label for="v">Volume</label><output id="ov">0.50</output></div>
     <input type="range" id="v" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">pot R10+R11 &mdash; niveau de sortie</div></div>
-</div>
-
-<div class="card">
-  <div class="row"><label>Diodes d'&eacute;cr&ecirc;tage</label></div>
-  <div class="grid" id="diodes">
-    <button data-d="0">SANS<small>rails &plusmn;12 V</small></button>
-    <button data-d="1">SILICIUM<small>&plusmn;0,6 V</small></button>
-    <button data-d="2">LED<small>&plusmn;1,7 V</small></button>
-    <button data-d="3">GERMA.<small>&plusmn;0,3 V</small></button>
-  </div>
 </div>
 
 <div class="card fswrap">
@@ -187,11 +198,12 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </div>
 
 <script>
-var st={g:0.5,c:0.85,t:0.5,v:0.5,e:1,d:1};
+var KEYS=['g','d','b','m','h','t','v'];
+var st={g:0.5,d:0.3,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
 var timer=null,lastEdit=0;
 function $(id){return document.getElementById(id)}
 function paint(){
-  ['g','c','t','v'].forEach(function(k){
+  KEYS.forEach(function(k){
     var el=$(k),min=+el.min,max=+el.max;
     el.value=st[k];
     el.style.setProperty('--p',(100*(st[k]-min)/(max-min))+'%');
@@ -200,8 +212,6 @@ function paint(){
   var on=(st.e==1);
   $('fsw').className=on?'on':'';
   $('fswtxt').textContent=on?'EFFET ON':'BYPASS';
-  var bs=document.querySelectorAll('#diodes button');
-  for(var i=0;i<bs.length;i++)bs[i].className=(+bs[i].getAttribute('data-d')==st.d)?'sel':'';
 }
 function link(ok){
   $('dot').className='dot'+(ok?' on':'');
@@ -210,22 +220,18 @@ function link(ok){
 function push(){
   clearTimeout(timer);
   timer=setTimeout(function(){
-    fetch('/api/set?g='+st.g+'&c='+st.c+'&t='+st.t+'&v='+st.v+'&e='+st.e+'&d='+st.d)
+    var q=KEYS.map(function(k){return k+'='+st[k]}).join('&');
+    fetch('/api/set?'+q+'&e='+st.e)
       .then(function(r){link(r.ok)}).catch(function(){link(false)});
   },120);
 }
-['g','c','t','v'].forEach(function(k){
+KEYS.forEach(function(k){
   $(k).addEventListener('input',function(){
     st[k]=+this.value;lastEdit=Date.now();paint();push();
   });
 });
 $('fsw').addEventListener('click',function(){
   st.e=st.e==1?0:1;lastEdit=Date.now();paint();push();
-});
-document.querySelectorAll('#diodes button').forEach(function(b){
-  b.addEventListener('click',function(){
-    st.d=+this.getAttribute('data-d');lastEdit=Date.now();paint();push();
-  });
 });
 function poll(){
   fetch('/api/get').then(function(r){return r.json()}).then(function(j){
@@ -255,9 +261,9 @@ static void sendParamsEspNow() {
 }
 
 static void logParams(const char *src) {
-  Serial.printf("[%s] Paramètres : G=%.2f C=%.2f T=%.2f V=%.2f E=%d D=%d\n",
-                src, params.gain, params.clip, params.tone, params.volume,
-                params.effectOn, params.diode);
+  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
+                src, params.gain, params.dist, params.low, params.mid,
+                params.high, params.tone, params.volume, params.effectOn);
 }
 
 // ---------------------------------------------------------------------------
@@ -267,25 +273,28 @@ static void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// GET /api/get  ->  {"g":0.50,"c":0.85,"t":0.50,"v":0.50,"e":1,"d":1}
+// GET /api/get  ->  {"g":0.50,"d":0.30,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
 static void handleApiGet() {
-  char buf[112];
+  char buf[144];
   snprintf(buf, sizeof(buf),
-           "{\"g\":%.2f,\"c\":%.2f,\"t\":%.2f,\"v\":%.2f,\"e\":%d,\"d\":%d}",
-           params.gain, params.clip, params.tone, params.volume,
-           params.effectOn, params.diode);
+           "{\"g\":%.2f,\"d\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
+           "\"t\":%.2f,\"v\":%.2f,\"e\":%d}",
+           params.gain, params.dist, params.low, params.mid, params.high,
+           params.tone, params.volume, params.effectOn);
   server.send(200, "application/json", buf);
 }
 
-// GET /api/set?g=0.8&c=0.85&t=0.4&v=0.6&e=1&d=1  (chaque argument est optionnel)
+// GET /api/set?g=0.8&d=0.5&b=0.5&m=0.6&h=0.4&t=0.4&v=0.6&e=1  (arguments optionnels)
 static void handleApiSet() {
   bool changed = false;
   if (server.hasArg("g")) { params.gain   = clampf(server.arg("g").toFloat(), GAIN_MIN, GAIN_MAX);     changed = true; }
-  if (server.hasArg("c")) { params.clip   = clampf(server.arg("c").toFloat(), CLIP_MIN, CLIP_MAX);     changed = true; }
+  if (server.hasArg("d")) { params.dist   = clampf(server.arg("d").toFloat(), 0.0f, 1.0f);             changed = true; }
+  if (server.hasArg("b")) { params.low    = clampf(server.arg("b").toFloat(), 0.0f, 1.0f);             changed = true; }
+  if (server.hasArg("m")) { params.mid    = clampf(server.arg("m").toFloat(), 0.0f, 1.0f);             changed = true; }
+  if (server.hasArg("h")) { params.high   = clampf(server.arg("h").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("t")) { params.tone   = clampf(server.arg("t").toFloat(), TONE_MIN, TONE_MAX);     changed = true; }
   if (server.hasArg("v")) { params.volume = clampf(server.arg("v").toFloat(), VOLUME_MIN, VOLUME_MAX); changed = true; }
   if (server.hasArg("e")) { params.effectOn = (server.arg("e").toInt() >= 1) ? 1 : 0;                  changed = true; }
-  if (server.hasArg("d")) { params.diode  = (uint8_t)clampf((float)server.arg("d").toInt(), 0.0f, 3.0f); changed = true; }
   if (changed) {
     paramsDirty = true;
     logParams("WEB");
@@ -303,7 +312,7 @@ static void handleNotFound() {
 
 // ---------------------------------------------------------------------------
 // Commandes texte sur le port série (bonus, même format qu'avant)
-//   G:0.8;C:0.85;T:0.4;V:0.6;E:1;D:1
+//   G:0.8;D:0.5;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1
 // ---------------------------------------------------------------------------
 static void parseCommand(const String &cmd) {
   int i = 0;
@@ -325,11 +334,13 @@ static void parseCommand(const String &cmd) {
 
     switch (key) {
       case 'G': params.gain   = clampf(v, GAIN_MIN, GAIN_MAX);       changed = true; break;
-      case 'C': params.clip   = clampf(v, CLIP_MIN, CLIP_MAX);       changed = true; break;
+      case 'D': params.dist   = clampf(v, 0.0f, 1.0f);               changed = true; break;
+      case 'B': params.low    = clampf(v, 0.0f, 1.0f);               changed = true; break;
+      case 'M': params.mid    = clampf(v, 0.0f, 1.0f);               changed = true; break;
+      case 'H': params.high   = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'T': params.tone   = clampf(v, TONE_MIN, TONE_MAX);       changed = true; break;
       case 'V': params.volume = clampf(v, VOLUME_MIN, VOLUME_MAX);   changed = true; break;
       case 'E': params.effectOn = (v >= 0.5f) ? 1 : 0;               changed = true; break;
-      case 'D': params.diode  = (uint8_t)clampf(v, 0.0f, 3.0f);      changed = true; break;
       default:  break;
     }
   }
@@ -396,7 +407,7 @@ void setup() {
   server.begin();
 
   Serial.println("[Web] Serveur démarré. Connectez le téléphone au WiFi puis ouvrez http://192.168.4.1");
-  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;C:0.85;T:0.4;V:0.6;E:1;D:1");
+  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
 }
 
 // ---------------------------------------------------------------------------
