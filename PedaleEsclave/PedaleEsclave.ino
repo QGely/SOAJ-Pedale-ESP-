@@ -5,33 +5,34 @@
  * ============================================================================
  *
  *  Rôle :
- *    - Reçoit UNIQUEMENT des paramètres (gain, tone, volume, ON/OFF)
- *      du maître via ESP-NOW. Aucun audio ne transite par radio.
- *    - Lit la guitare sur l'ADC (GPIO34, ADC1 : compatible WiFi/ESP-NOW).
- *    - Applique la fonction de transfert H(s,g,t,v) du circuit TL082
- *      (réponse LINÉAIRE pure, pas de saturation numérique ajoutée).
- *    - Sort le signal traité sur le DAC interne (GPIO25), centré sur 128.
+ *    - Reçoit UNIQUEMENT des paramètres du maître via ESP-NOW.
+ *    - Lit la guitare sur l'ADC (GPIO34), traite, sort sur le DAC (GPIO25).
  *
- *  Formule implémentée (voir README) :
- *    H(s,g,t,v) = Hin(s) × Hampli(s,g) × Hsortie(s,t,v)
+ *  Formule complète (7 potentiomètres g, d, b, m, h, t, v) :
  *
- *    Hin(s)      = 0.47·s / (1 + 0.4747·s)
- *                  (liaison d'entrée R4/C3/R3 — passe-haut ~0,335 Hz)
+ *    y = Hsortie(s,t,v) · EQh(s,h) · EQm(s,m) · EQb(s,b) · S( Hampli(s,g) · Hin(s) · x , d )
  *
- *    Hampli(s,g) = 1 + (0.11·g·s) / ((1 + 5e-5·g·s)(1 + 2.2e-4·s))
- *                  (ampli non-inverseur : R5 = g·500k, C4 100 pF, R7 1k, C5 220 nF)
+ *  Étages linéaires (transformation bilinéaire s = 2·fs·(1−z⁻¹)/(1+z⁻¹)) :
+ *    Hin(s)      = 0.47·s / (1 + 0.4747·s)                (liaison d'entrée)
+ *    Hampli(s,g) = 1 + 0.11·g·s / ((1+5e-5·g·s)(1+2.2e-4·s))   (ampli TL082)
+ *    EQb(s,b)    = low-shelf  100 Hz, −12..+12 dB (b : 0.5 = plat)
+ *    EQm(s,m)    = peak       700 Hz, Q=0.9, −12..+12 dB (m : 0.5 = plat)
+ *    EQh(s,h)    = high-shelf 3,2 kHz, −12..+12 dB (h : 0.5 = plat)
+ *    Hsortie(s,t,v) = 0.1·v·s / (1 + (0.11242−0.00022·t)·s
+ *                                  + (2.42e-5·t − 2.2e-6·t²)·s²)  (tone+volume)
  *
- *    Hsortie(s,t,v) = 0.1·v·s / (1 + (0.11242 − 0.00022·t)·s
- *                                  + (2.42e-5·t − 2.2e-6·t²)·s²)
- *                  (tone R8/R9 10k + C7 22 nF, liaison C6 1 µF, volume R10/R11 100k)
- *
- *  Chaque étage est converti en filtre numérique IIR (biquad) par
- *  transformation bilinéaire  s = 2·fs·(1 − z⁻¹)/(1 + z⁻¹)  à 20 kHz.
+ *  Étage NON-LINÉAIRE S(u,d) — saturation réglable de zéro à extrême :
+ *    d = 0 : S(u,0) = u                     (strictement linéaire, 0 distorsion)
+ *    d > 0 : seuil d'écrêtage Vsat = 2·10^(−2.3·d)   (de ±2.0 à ±0.01, log)
+ *            S(u,d) = u + ( tanh(u/Vsat) − u ) · w(d),  w = min(1, 4·d)
+ *            -> tanh de plus en plus serré = du léger crunch au fuzz carré.
  *
  *  IMPORTANT — matériel :
  *    L'entrée GPIO34 ne supporte NI tension négative NI plus de 3,3 V.
- *    La guitare doit passer par un condensateur de liaison + pont diviseur
- *    de polarisation à 1,65 V (voir README.md, section câblage).
+ *    (condensateur de liaison + pont diviseur 1,65 V, voir README.md)
+ *
+ *  NB : le paquet ESP-NOW a changé (7 paramètres) — re-téléverser le MAÎTRE
+ *  en même temps que ce fichier, sinon les réglages seront ignorés.
  *
  *  Carte : ELEGOO ESP32 (NodeMCU-like, CP2102) — Arduino IDE, "ESP32 Dev Module".
  * ============================================================================
@@ -65,42 +66,45 @@
 // Amplification d'entrée logicielle (1.0 = strictement fidèle au circuit)
 #define INPUT_GAIN          2.0f
 
-// Niveau de sortie global (1.0 = fidèle à la formule ; baisser si ça sature
-// trop fort le DAC — la formule peut donner un gain de plusieurs centaines)
+// Niveau de sortie global
 #define OUTPUT_LEVEL        1.0f
 
 // Bypass : rattrapage de niveau quand l'effet est coupé
 #define BYPASS_GAIN         8.0f
 
-// Course du potentiomètre DRIVE :
-//   1 = course logarithmique (pot "audio") : le bouton est progressif,
-//       g réel = (e^(p·ln501) − 1)/500 -> p=0.5 donne g≈0.043 (gain ~×20)
-//   0 = course linéaire, strictement fidèle au schéma (R5 = p·500k) —
-//       attention : dès p=0.1 le gain dépasse ×50, tout le haut de la
-//       course sature le DAC de la même façon
+// Course du potentiomètre DRIVE (1 = logarithmique, 0 = linéaire fidèle)
 #define DRIVE_TAPER_LOG     1
+
+// --- Saturation S(u,d) ------------------------------------------------------
+// Seuil d'écrêtage : Vsat = SAT_V0 · 10^(−SAT_LOGSPAN·d)
+//   d=0 -> ±2.0 (aucun écrêtage audible), d=1 -> ±0.01 (fuzz extrême, rapport 200)
+#define SAT_V0              2.0f
+#define SAT_LOGSPAN         2.3f
+// Fondu linéaire->saturé sur le premier quart de la course (continuité à d=0)
+#define SAT_MIX_RAMP        4.0f
+
+// --- Égaliseur 3 bandes (formules RBJ "Audio EQ Cookbook") ------------------
+#define EQ_LOW_HZ           100.0f    // low-shelf
+#define EQ_MID_HZ           700.0f    // peak
+#define EQ_MID_Q            0.9f
+#define EQ_HIGH_HZ          3200.0f   // high-shelf
+#define EQ_RANGE_DB         12.0f     // course des pots : −12 dB .. +12 dB
 
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
 
-// Recalcul des coefficients de filtres tous les N échantillons (~3 ms) :
-// assez fréquent pour suivre le lissage, assez rare pour tenir les 50 µs
-// du cycle audio (le recalcul contient des divisions coûteuses)
+// Recalcul des coefficients tous les N échantillons (~3 ms)
 #define COEF_UPDATE_SAMPLES 64
 
 // Suivi de l'offset DC (très lent, ~100 ms)
 #define DC_TRACK_COEF       0.0005f
 
-// Vu-mètre de diagnostic (1 = affiche chaque seconde sur port série)
-// ATTENTION : bloque l'audio ~10 ms par seconde -> craquement périodique.
-// ACTIVÉ pendant la mise au point — remettre à 0 quand tout fonctionne.
-#define DEBUG_METER         1
+// Vu-mètre de diagnostic (1 = une ligne/seconde sur le port série ;
+// bloque l'audio ~10 ms -> craquement périodique. 0 pour JOUER.)
+#define DEBUG_METER         0
 
-// Bip de test au démarrage : 2 bips de 440 Hz envoyés DIRECTEMENT au DAC,
-// sans passer par l'ADC ni par la formule. Si vous n'entendez PAS les bips,
-// le problème est entre le GPIO25 et l'ampli (câblage, condensateur de
-// liaison, volume ampli), pas dans le traitement. Mettre à 0 pour désactiver.
-#define STARTUP_TEST_TONE   1
+// Bip de test 440 Hz au démarrage (diagnostic du chemin DAC -> ampli)
+#define STARTUP_TEST_TONE   0
 
 // Bornes de sécurité des paramètres
 #define GAIN_MIN            0.0f
@@ -114,16 +118,22 @@
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
-  float    gain;
-  float    clip;      // ignoré en mode linéaire (gardé pour compatibilité)
-  float    tone;
-  float    volume;
-  uint8_t  effectOn;
-  uint8_t  diode;     // ignoré en mode linéaire (gardé pour compatibilité)
+  float    gain;      // g : drive (0..1)
+  float    dist;      // d : saturation (0 = aucune .. 1 = extrême)
+  float    low;       // b : graves  (0..1, 0.5 = plat, ±12 dB)
+  float    mid;       // m : médiums (0..1, 0.5 = plat, ±12 dB)
+  float    high;      // h : aigus   (0..1, 0.5 = plat, ±12 dB)
+  float    tone;      // t : tonalité (0..1)
+  float    volume;    // v : volume (0..1)
+  uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
 } PedalParams;
 
-// Cibles reçues par radio
+// Cibles reçues par radio (défauts si le maître n'est pas encore là)
 static volatile float tgtGain   = 0.5f;
+static volatile float tgtDist   = 0.3f;   // léger crunch par défaut
+static volatile float tgtLow    = 0.5f;   // EQ plat
+static volatile float tgtMid    = 0.5f;
+static volatile float tgtHigh   = 0.5f;
 static volatile float tgtTone   = 0.5f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
@@ -132,8 +142,8 @@ static volatile float tgtEffect = 1.0f;
 // Biquad IIR : y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
 // ---------------------------------------------------------------------------
 typedef struct {
-  float b0, b1, b2;   // coefficients du numérateur
-  float a1, a2;       // coefficients du dénominateur (a0 normalisé à 1)
+  float b0, b1, b2;   // numérateur
+  float a1, a2;       // dénominateur (a0 normalisé à 1)
   float x1, x2;       // x[n-1], x[n-2]
   float y1, y2;       // y[n-1], y[n-2]
 } Biquad;
@@ -148,9 +158,7 @@ static inline float biquadRun(Biquad *f, float x) {
 
 // Transformation bilinéaire GÉNÉRIQUE :
 //   H(s) = (n0 + n1·s + n2·s²) / (d0 + d1·s + d2·s²)
-// devient un biquad en z avec s = K·(1 − z⁻¹)/(1 + z⁻¹), K = 2·fs.
-// Ne touche PAS à l'état (x1..y2) : on peut recalculer les coefficients
-// en cours de route sans "pop".
+// Ne touche pas à l'état : coefficients modifiables en cours de route.
 static void bilinear2(Biquad *f,
                       float n0, float n1, float n2,
                       float d0, float d1, float d2) {
@@ -177,10 +185,6 @@ static void calcHin(Biquad *f) {
 }
 
 // --- Étage 2 : Hampli(s,g) = 1 + 0.11·g·s / ((1+5e-5·g·s)(1+2.2e-4·s)) -----
-// Mise au même dénominateur :
-//   num = 1 + (τ1+τ2+0.11·g)·s + τ1·τ2·s²
-//   den = 1 + (τ1+τ2)·s        + τ1·τ2·s²
-// avec τ1 = R5·C4 = 5e-5·g  et  τ2 = R7·C5 = 2.2e-4.
 static void calcAmpli(Biquad *f, float g) {
   const float t1 = 5e-5f * g;
   const float t2 = 2.2e-4f;
@@ -189,14 +193,71 @@ static void calcAmpli(Biquad *f, float g) {
                1.0f, t1 + t2,      t1 * t2);
 }
 
-// --- Étage 3 : Hsortie(s,t,v) -----------------------------------------------
-//   num = 0.1·v·s
-//   den = 1 + (0.11242 − 0.00022·t)·s + (2.42e-5·t − 2.2e-6·t²)·s²
+// --- Étage 6 : Hsortie(s,t,v) -----------------------------------------------
 static void calcSortie(Biquad *f, float t, float v) {
   const float d1 = 0.11242f - 0.00022f * t;
   const float d2 = 2.42e-5f * t - 2.2e-6f * t * t;
   bilinear2(f, 0.0f, 0.1f * v, 0.0f,
                1.0f, d1,       d2);
+}
+
+// --- Étages 4-5 : égaliseur 3 bandes (RBJ Audio EQ Cookbook) ----------------
+// Le paramètre p (0..1) devient un gain en dB : (p − 0.5) · 2 · EQ_RANGE_DB.
+
+static void calcLowShelf(Biquad *f, float f0, float dB) {
+  const float A  = powf(10.0f, dB / 40.0f);
+  const float w0 = 2.0f * (float)M_PI * f0 / (float)SAMPLE_RATE_HZ;
+  const float cw = cosf(w0), sw = sinf(w0);
+  const float alpha = sw * 0.5f * sqrtf(2.0f);          // pente S = 1
+  const float k  = 2.0f * sqrtf(A) * alpha;
+
+  const float b0 =        A * ((A + 1.0f) - (A - 1.0f) * cw + k);
+  const float b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cw);
+  const float b2 =        A * ((A + 1.0f) - (A - 1.0f) * cw - k);
+  const float a0 =             (A + 1.0f) + (A - 1.0f) * cw + k;
+  const float a1 =    -2.0f * ((A - 1.0f) + (A + 1.0f) * cw);
+  const float a2 =             (A + 1.0f) + (A - 1.0f) * cw - k;
+
+  const float inv = 1.0f / a0;
+  f->b0 = b0 * inv;  f->b1 = b1 * inv;  f->b2 = b2 * inv;
+  f->a1 = a1 * inv;  f->a2 = a2 * inv;
+}
+
+static void calcHighShelf(Biquad *f, float f0, float dB) {
+  const float A  = powf(10.0f, dB / 40.0f);
+  const float w0 = 2.0f * (float)M_PI * f0 / (float)SAMPLE_RATE_HZ;
+  const float cw = cosf(w0), sw = sinf(w0);
+  const float alpha = sw * 0.5f * sqrtf(2.0f);          // pente S = 1
+  const float k  = 2.0f * sqrtf(A) * alpha;
+
+  const float b0 =         A * ((A + 1.0f) + (A - 1.0f) * cw + k);
+  const float b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cw);
+  const float b2 =         A * ((A + 1.0f) + (A - 1.0f) * cw - k);
+  const float a0 =              (A + 1.0f) - (A - 1.0f) * cw + k;
+  const float a1 =      2.0f * ((A - 1.0f) - (A + 1.0f) * cw);
+  const float a2 =              (A + 1.0f) - (A - 1.0f) * cw - k;
+
+  const float inv = 1.0f / a0;
+  f->b0 = b0 * inv;  f->b1 = b1 * inv;  f->b2 = b2 * inv;
+  f->a1 = a1 * inv;  f->a2 = a2 * inv;
+}
+
+static void calcPeak(Biquad *f, float f0, float Q, float dB) {
+  const float A  = powf(10.0f, dB / 40.0f);
+  const float w0 = 2.0f * (float)M_PI * f0 / (float)SAMPLE_RATE_HZ;
+  const float cw = cosf(w0), sw = sinf(w0);
+  const float alpha = sw / (2.0f * Q);
+
+  const float b0 = 1.0f + alpha * A;
+  const float b1 = -2.0f * cw;
+  const float b2 = 1.0f - alpha * A;
+  const float a0 = 1.0f + alpha / A;
+  const float a1 = -2.0f * cw;
+  const float a2 = 1.0f - alpha / A;
+
+  const float inv = 1.0f / a0;
+  f->b0 = b0 * inv;  f->b1 = b1 * inv;  f->b2 = b2 * inv;
+  f->a1 = a1 * inv;  f->a2 = a2 * inv;
 }
 
 // Course du pot DRIVE : position du bouton p (0..1) -> variable g de la formule
@@ -208,22 +269,43 @@ static inline float driveTaper(float p) {
 #endif
 }
 
+// Position de pot EQ (0..1) -> gain en dB (−EQ_RANGE_DB .. +EQ_RANGE_DB)
+static inline float eqDb(float p) {
+  return (p - 0.5f) * 2.0f * EQ_RANGE_DB;
+}
+
 // ---------------------------------------------------------------------------
 // État du traitement audio
 // ---------------------------------------------------------------------------
 static float dcOffset = 2048.0f;
 static Biquad fHin    = {0};
 static Biquad fAmpli  = {0};
+static Biquad fLow    = {0};
+static Biquad fMid    = {0};
+static Biquad fHigh   = {0};
 static Biquad fSortie = {0};
 static float  quantErr = 0.0f;       // mise en forme du bruit DAC
 
-// Paramètres lissés (valeurs effectives utilisées par l'audio)
+// Paramètres lissés
 static float smGain    = 0.5f;
+static float smDist    = 0.3f;
+static float smLow     = 0.5f;
+static float smMid     = 0.5f;
+static float smHigh    = 0.5f;
 static float smTone    = 0.5f;
 static float smVolume  = 0.0f;       // démarre à 0 : montée douce, pas de "pop"
 static float smEffect  = 1.0f;
 
-static uint16_t coefCountdown = 0;   // recalcul périodique des coefficients
+// Coefficients de saturation (recalculés toutes les ~3 ms, pas à chaque
+// échantillon : powf est coûteux)
+static float satVsat = 1.0f;
+static float satMix  = 0.0f;
+
+// Dernières valeurs EQ pour lesquelles les biquads ont été calculés
+// (on ne refait le calcul trigonométrique que si le pot a vraiment bougé)
+static float eqLowCalc = -1.0f, eqMidCalc = -1.0f, eqHighCalc = -1.0f;
+
+static uint16_t coefCountdown = 0;
 static uint32_t nextSampleUs  = 0;
 
 // ---------------------------------------------------------------------------
@@ -258,10 +340,13 @@ static inline int readGuitarAdc() {
 // ---------------------------------------------------------------------------
 static void applyParams(const PedalParams *p) {
   tgtGain   = clampf(p->gain,   GAIN_MIN, GAIN_MAX);
+  tgtDist   = clampf(p->dist,   0.0f, 1.0f);
+  tgtLow    = clampf(p->low,    0.0f, 1.0f);
+  tgtMid    = clampf(p->mid,    0.0f, 1.0f);
+  tgtHigh   = clampf(p->high,   0.0f, 1.0f);
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
   tgtEffect = p->effectOn ? 1.0f : 0.0f;
-  // p->clip et p->diode sont ignorés : la chaîne est purement linéaire
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -271,7 +356,7 @@ static void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int
 static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   (void)mac;
 #endif
-  if (len != (int)sizeof(PedalParams)) return;
+  if (len != (int)sizeof(PedalParams)) return;   // ancien maître -> ignoré
   PedalParams p;
   memcpy(&p, data, sizeof(p));
   if (p.magic != PARAMS_MAGIC) return;
@@ -295,17 +380,11 @@ static inline void meterTick(float raw) {
       Serial.printf("[Metre] entree crete: %.0f pas ADC — PAS DE SIGNAL GUITARE "
                     "(verifiez jack, condensateur de liaison et pont diviseur)\n",
                     mPeakIn);
-    } else if (mPeakOut < 2) {
-      const float g = driveTaper(smGain);
-      Serial.printf("[Metre] entree: %.0f pas ADC mais sortie DAC ~0 — signal "
-                    "PERDU dans le traitement (G=%.2f g=%.3f T=%.2f V=%.3f E=%.0f)\n",
-                    mPeakIn, smGain, g, smTone, smVolume, smEffect);
     } else {
-      const float g = driveTaper(smGain);
       Serial.printf("[Metre] entree: %.0f pas ADC | sortie DAC: +/-%d pas | "
-                    "G=%.2f (g=%.3f, gain max ~x%.0f) T=%.2f V=%.3f E=%.0f\n",
-                    mPeakIn, mPeakOut, smGain, g, 1.0f + 500.0f * g,
-                    smTone, smVolume, smEffect);
+                    "G=%.2f D=%.2f (Vsat=%.3f) B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
+                    mPeakIn, mPeakOut, smGain, smDist, satVsat,
+                    smLow, smMid, smHigh, smTone, smVolume, smEffect);
     }
     mPeakIn  = 0.0f;
     mPeakOut = 0;
@@ -315,8 +394,7 @@ static inline void meterTick(float raw) {
 #endif
 
 // ---------------------------------------------------------------------------
-// Bip de test : sinus envoyé directement au DAC (ne passe ni par l'ADC,
-// ni par la formule). Sert à valider le chemin GPIO25 -> ampli.
+// Bip de test : sinus envoyé directement au DAC (diagnostic sortie)
 // ---------------------------------------------------------------------------
 #if STARTUP_TEST_TONE
 static void playTestTone(float freqHz, float durSec, float amp) {
@@ -325,28 +403,50 @@ static void playTestTone(float freqHz, float durSec, float amp) {
   for (uint32_t i = 0; i < n; i++) {
     const float s = amp * sinf(w * (float)i);
     dacWrite(PIN_AUDIO_OUT, (uint8_t)lroundf(128.0f + s * 127.0f));
-    delayMicroseconds(SAMPLE_PERIOD_US - 12);   // ~12 µs déjà consommés
+    delayMicroseconds(SAMPLE_PERIOD_US - 12);
   }
   dacWrite(PIN_AUDIO_OUT, 128);
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// Traitement d'UN échantillon : y = Hin × Hampli × Hsortie appliqué à x
+// Traitement d'UN échantillon
 // ---------------------------------------------------------------------------
 static inline void processSample() {
   // Lissage des paramètres (progression douce, pas de craquement)
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
+  smDist   += PARAM_SMOOTH * (tgtDist   - smDist);
+  smLow    += PARAM_SMOOTH * (tgtLow    - smLow);
+  smMid    += PARAM_SMOOTH * (tgtMid    - smMid);
+  smHigh   += PARAM_SMOOTH * (tgtHigh   - smHigh);
   smTone   += PARAM_SMOOTH * (tgtTone   - smTone);
   smVolume += PARAM_SMOOTH * (tgtVolume - smVolume);
   smEffect += PARAM_SMOOTH * (tgtEffect - smEffect);
 
-  // Recalcul périodique des coefficients (g, t, v changent lentement grâce
-  // au lissage ; recalculer chaque échantillon ne tiendrait pas dans les 50 µs)
+  // Recalcul périodique des coefficients (~3 ms). Les biquads d'EQ, plus
+  // coûteux (cos/sin/pow), ne sont refaits que si leur pot a bougé.
   if (coefCountdown == 0) {
     coefCountdown = COEF_UPDATE_SAMPLES;
+
     calcAmpli(&fAmpli, driveTaper(smGain));
     calcSortie(&fSortie, smTone, smVolume);
+
+    satVsat = SAT_V0 * powf(10.0f, -SAT_LOGSPAN * smDist);
+    satMix  = (smDist < 0.01f) ? 0.0f
+            : (smDist * SAT_MIX_RAMP > 1.0f ? 1.0f : smDist * SAT_MIX_RAMP);
+
+    if (fabsf(smLow - eqLowCalc) > 0.002f) {
+      calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));
+      eqLowCalc = smLow;
+    }
+    if (fabsf(smMid - eqMidCalc) > 0.002f) {
+      calcPeak(&fMid, EQ_MID_HZ, EQ_MID_Q, eqDb(smMid));
+      eqMidCalc = smMid;
+    }
+    if (fabsf(smHigh - eqHighCalc) > 0.002f) {
+      calcHighShelf(&fHigh, EQ_HIGH_HZ, eqDb(smHigh));
+      eqHighCalc = smHigh;
+    }
   }
   coefCountdown--;
 
@@ -359,10 +459,23 @@ static inline void processSample() {
   meterTick((float)raw);
 #endif
 
-  // --- La formule : trois étages en cascade ---
-  float y = biquadRun(&fHin,    x);   // Hin(s)
-  y       = biquadRun(&fAmpli,  y);   // Hampli(s,g)
-  y       = biquadRun(&fSortie, y);   // Hsortie(s,t,v)
+  // --- 1-2. Étages linéaires d'entrée ---
+  float y = biquadRun(&fHin,   x);    // Hin(s)
+  y       = biquadRun(&fAmpli, y);    // Hampli(s,g)
+
+  // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz extrême ---
+  if (satMix > 0.0f) {
+    const float sat = tanhf(y / satVsat);   // écrêtage doux, sortie ±1
+    y += (sat - y) * satMix;                // fondu linéaire <-> saturé
+  }
+
+  // --- 4-5. Égaliseur 3 bandes ---
+  y = biquadRun(&fLow,  y);           // low-shelf  100 Hz
+  y = biquadRun(&fMid,  y);           // peak       700 Hz
+  y = biquadRun(&fHigh, y);           // high-shelf 3,2 kHz
+
+  // --- 6. Tone + volume ---
+  y = biquadRun(&fSortie, y);         // Hsortie(s,t,v)
 
   // --- Bypass en fondu : mélange signal direct <-> signal traité ---
   const float dry = x * BYPASS_GAIN;
@@ -374,7 +487,6 @@ static inline void processSample() {
   if (dacVal < 0)   dacVal = 0;
   if (dacVal > 255) dacVal = 255;
   quantErr = desired - (float)dacVal;
-  // En cas d'écrêtage DAC, ne pas accumuler une erreur géante
   if (quantErr >  1.0f) quantErr =  1.0f;
   if (quantErr < -1.0f) quantErr = -1.0f;
 
@@ -392,7 +504,7 @@ static inline void processSample() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ Pédale — ESCLAVE v3-diagnostic (formule H(s,g,t,v), linéaire) ===");
+  Serial.println("\n=== SOAJ Pédale — ESCLAVE v4 (formule + saturation + EQ 3 bandes) ===");
 
   // --- ADC ---
 #ifdef USE_LEGACY_ADC
@@ -406,10 +518,15 @@ void setup() {
   // --- DAC : sortie au repos = 128 (milieu, aucun son) ---
   dacWrite(PIN_AUDIO_OUT, 128);
 
-  // --- Coefficients initiaux des trois étages ---
+  // --- Coefficients initiaux de tous les étages ---
   calcHin(&fHin);
   calcAmpli(&fAmpli, driveTaper(smGain));
   calcSortie(&fSortie, smTone, smVolume);
+  calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));    eqLowCalc  = smLow;
+  calcPeak(&fMid, EQ_MID_HZ, EQ_MID_Q, eqDb(smMid)); eqMidCalc = smMid;
+  calcHighShelf(&fHigh, EQ_HIGH_HZ, eqDb(smHigh)); eqHighCalc = smHigh;
+  satVsat = SAT_V0 * powf(10.0f, -SAT_LOGSPAN * smDist);
+  satMix  = (smDist * SAT_MIX_RAMP > 1.0f) ? 1.0f : smDist * SAT_MIX_RAMP;
 
   // --- WiFi / ESP-NOW ---
   WiFi.mode(WIFI_STA);
@@ -425,7 +542,7 @@ void setup() {
 
   Serial.print("[WiFi] MAC esclave : ");
   Serial.println(WiFi.macAddress());
-  Serial.printf("Audio : %d Hz — H(s,g,t,v) = Hin x Hampli x Hsortie (lineaire)\n",
+  Serial.printf("Audio : %d Hz — Hin x Hampli -> S(u,d) -> EQ 3 bandes -> Hsortie\n",
                 SAMPLE_RATE_HZ);
 
   // Stabilisation de l'offset DC avant de sortir du son (évite le "plop")
@@ -440,8 +557,6 @@ void setup() {
   }
 
 #if STARTUP_TEST_TONE
-  // Deux bips de 440 Hz directement sur le DAC : si vous ne les entendez pas
-  // dans l'ampli, le problème est le câblage de sortie, pas le traitement.
   Serial.println("[Test] BIP 440 Hz x2 sur le DAC (test du chemin de sortie)...");
   playTestTone(440.0f, 0.35f, 0.6f);
   delay(150);
