@@ -12,6 +12,13 @@
  *
  *    y = Hsortie(s,t,v) · EQh(s,h) · EQm(s,m) · EQb(s,b) · S( Hampli(s,g) · Hin(s) · x , d )
  *
+ *  + NOISE GATE (indispensable en high-gain : sans lui, guitare à volume 0,
+ *    le bruit ADC est normalisé vers ±1 par le fuzz -> souffle constant).
+ *    Enveloppe mesurée sur l'entrée ; gain du gate appliqué AVANT l'étage de
+ *    gain ET APRÈS la saturation (atténuation au carré pendant la fermeture,
+ *    la disto ne peut pas "remonter" le fondu). Seuils proportionnels à
+ *    (1 + 2·g + 2·d) : plus de drive/fuzz = fermeture plus précoce.
+ *
  *  Étages linéaires (transformation bilinéaire s = 2·fs·(1−z⁻¹)/(1+z⁻¹)) :
  *    Hin(s)      = 0.47·s / (1 + 0.4747·s)                (liaison d'entrée)
  *    Hampli(s,g) = 1 + 0.11·g·s / ((1+5e-5·g·s)(1+2.2e-4·s))   (ampli TL082)
@@ -101,6 +108,25 @@
 #define EQ_MID_Q            0.9f
 #define EQ_HIGH_HZ          3200.0f   // high-shelf
 #define EQ_RANGE_DB         12.0f     // course des pots : −12 dB .. +12 dB
+
+// --- Noise gate --------------------------------------------------------------
+// Sans gate, guitare à volume 0 : le bruit de fond de l'ADC (~1-2 pas) est
+// normalisé vers ±1 par le fuzz -> souffle constant. Le gate mesure
+// l'enveloppe du signal d'ENTRÉE et applique son gain DEUX fois : avant
+// l'étage de gain ET après la saturation (sinon la disto recomprime le fondu
+// de fermeture et on entend le bruit "redescendre").
+// Amplitudes normalisées : une guitare directe fait ~0.12 en crête (avec
+// INPUT_GAIN 2), le bruit ADC ~0.001-0.003.
+#define GATE_LOW            0.003f    // en dessous : fermé
+#define GATE_HIGH           0.009f    // au-dessus : complètement ouvert
+#define GATE_DRIVE_SCALE    2.0f      // seuils x(1 + 2·G ...)
+#define GATE_DIST_SCALE     2.0f      //        ...  + 2·D) : plus de gain/fuzz
+                                      // = fermeture plus tôt (règle high-gain)
+#define ENV_ATTACK          0.01f     // montée d'enveloppe ~2,5 ms (un parasite
+                                      // d'UN échantillon n'ouvre pas le gate)
+#define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
+#define GATE_OPEN_COEF      0.010f    // ouverture ~5 ms
+#define GATE_CLOSE_COEF     0.0008f   // fermeture douce ~60 ms (garde le sustain)
 
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
@@ -297,6 +323,8 @@ static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
 static Biquad fSortie = {0};
 static float  quantErr = 0.0f;       // mise en forme du bruit DAC
+static float  envelope = 0.0f;       // suiveur d'enveloppe du gate
+static float  gateGain = 0.0f;       // gain du gate (0..1)
 
 // Paramètres lissés
 static float smGain    = 0.5f;
@@ -397,9 +425,11 @@ static inline void meterTick(float raw) {
                     "(verifiez jack, condensateur de liaison et pont diviseur)\n",
                     mPeakIn);
     } else {
-      Serial.printf("[Metre] entree: %.0f pas ADC | sortie DAC: +/-%d pas | "
-                    "G=%.2f D=%.2f (Vsat=%.3f) B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
-                    mPeakIn, mPeakOut, smGain, smDist, satVsat,
+      Serial.printf("[Metre] entree: %.0f pas ADC | env=%.4f gate=%s(%.2f) | "
+                    "sortie DAC: +/-%d pas | G=%.2f D=%.2f (Vsat=%.3f) "
+                    "B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
+                    mPeakIn, envelope, (gateGain > 0.5f) ? "OUVERT" : "ferme",
+                    gateGain, mPeakOut, smGain, smDist, satVsat,
                     smLow, smMid, smHigh, smTone, smVolume, smEffect);
     }
     mPeakIn  = 0.0f;
@@ -477,9 +507,26 @@ static inline void processSample() {
   meterTick((float)raw);
 #endif
 
-  // --- 1-2. Étages linéaires d'entrée ---
-  float y = biquadRun(&fHin,   x);    // Hin(s)
-  y       = biquadRun(&fAmpli, y);    // Hampli(s,g)
+  // --- Noise gate : enveloppe mesurée sur l'ENTRÉE (avant tout gain) ---
+  const float mag = fabsf(x);
+  envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE) * (mag - envelope);
+
+  const float gateScale = 1.0f + GATE_DRIVE_SCALE * smGain
+                               + GATE_DIST_SCALE  * smDist;
+  const float gLow  = GATE_LOW  * gateScale;
+  const float gHigh = GATE_HIGH * gateScale;
+
+  float gateTarget;
+  if      (envelope <= gLow)  gateTarget = 0.0f;
+  else if (envelope >= gHigh) gateTarget = 1.0f;
+  else    gateTarget = (envelope - gLow) / (gHigh - gLow);
+
+  gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : GATE_CLOSE_COEF)
+              * (gateTarget - gateGain);
+
+  // --- 1-2. Étages linéaires d'entrée (gate appliqué AVANT le gain) ---
+  float y = biquadRun(&fHin,   x) * gateGain;   // Hin(s)
+  y       = biquadRun(&fAmpli, y);              // Hampli(s,g)
 
   // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz Muse ---
   if (satMix > 0.0f) {
@@ -499,6 +546,11 @@ static inline void processSample() {
 
   // --- 6. Tone + volume ---
   y = biquadRun(&fSortie, y);         // Hsortie(s,t,v)
+
+  // --- Gate appliqué AUSSI en sortie : la saturation recomprime le fondu
+  //     d'entrée, sans cette 2e application on entendrait le bruit
+  //     "redescendre" à chaque fin de note (atténuation au carré) ---
+  y *= gateGain;
 
   // --- Bypass en fondu : mélange signal direct <-> signal traité ---
   const float dry = x * BYPASS_GAIN;
