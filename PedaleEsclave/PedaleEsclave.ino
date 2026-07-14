@@ -21,11 +21,14 @@
  *    Hsortie(s,t,v) = 0.1·v·s / (1 + (0.11242−0.00022·t)·s
  *                                  + (2.42e-5·t − 2.2e-6·t²)·s²)  (tone+volume)
  *
- *  Étage NON-LINÉAIRE S(u,d) — saturation réglable de zéro à extrême :
+ *  Étage NON-LINÉAIRE S(u,d) — voicing fuzz asymétrique (type Muse) :
  *    d = 0 : S(u,0) = u                     (strictement linéaire, 0 distorsion)
- *    d > 0 : seuil d'écrêtage Vsat = 2·10^(−2.3·d)   (de ±2.0 à ±0.01, log)
- *            S(u,d) = u + ( tanh(u/Vsat) − u ) · w(d),  w = min(1, 4·d)
- *            -> tanh de plus en plus serré = du léger crunch au fuzz carré.
+ *    d > 0 : Vsat = 2·10^(−2.3·d)   (seuil de ±2.0 à ±0.01, log)
+ *            soft = tanh( (u + 0.28·Vsat) / Vsat ) − tanh(0.28)   (asymétrique)
+ *            hard = clip( soft · (1 + 2.2·d), −1, +1 )            (bords carrés)
+ *            S(u,d) = u + ( hard − u ) · w(d),  w = min(1, 4·d)
+ *    L'asymétrie crée les harmoniques PAIRES (son "lampe"), l'écrêtage dur
+ *    final donne les bords carrés du fuzz — le caractère Bellamy/Fuzz Factory.
  *
  *  IMPORTANT — matériel :
  *    L'entrée GPIO34 ne supporte NI tension négative NI plus de 3,3 V.
@@ -75,11 +78,20 @@
 // Course du potentiomètre DRIVE (1 = logarithmique, 0 = linéaire fidèle)
 #define DRIVE_TAPER_LOG     1
 
-// --- Saturation S(u,d) ------------------------------------------------------
-// Seuil d'écrêtage : Vsat = SAT_V0 · 10^(−SAT_LOGSPAN·d)
+// --- Saturation S(u,d) — voicing "Fuzz Factory / lampe" (type Muse) ---------
+// Double étage :
+//   1. Écrêtage doux ASYMÉTRIQUE : tanh décalé de SAT_ASYM·Vsat -> le haut et
+//      le bas de l'onde n'écrêtent pas pareil = harmoniques PAIRES, le son
+//      "lampe" (un tanh symétrique ne produit que des harmoniques impaires,
+//      son plus stérile). C'est le caractère du fuzz de Bellamy.
+//   2. Écrêtage dur : le résultat est re-amplifié (×1 à d=0 -> ×3.2 à d=1)
+//      et tranché net à ±1 -> bords carrés, son fuzz/metal dense.
+// Seuil : Vsat = SAT_V0 · 10^(−SAT_LOGSPAN·d)
 //   d=0 -> ±2.0 (aucun écrêtage audible), d=1 -> ±0.01 (fuzz extrême, rapport 200)
 #define SAT_V0              2.0f
 #define SAT_LOGSPAN         2.3f
+#define SAT_ASYM            0.28f     // décalage d'asymétrie (en fractions de Vsat)
+#define SAT_HARD            2.2f      // poussée vers l'écrêtage dur à d max
 // Fondu linéaire->saturé sur le premier quart de la course (continuité à d=0)
 #define SAT_MIX_RAMP        4.0f
 
@@ -300,6 +312,10 @@ static float smEffect  = 1.0f;
 // échantillon : powf est coûteux)
 static float satVsat = 1.0f;
 static float satMix  = 0.0f;
+static float satBias = 0.0f;   // décalage d'asymétrie = SAT_ASYM · Vsat
+static float satHard = 1.0f;   // gain vers l'écrêtage dur = 1 + SAT_HARD · d
+// Compensation du décalage en sortie : tanh(SAT_ASYM), constant
+static const float SAT_BIAS_OUT = 0.27290f;   // tanh(0.28)
 
 // Dernières valeurs EQ pour lesquelles les biquads ont été calculés
 // (on ne refait le calcul trigonométrique que si le pot a vraiment bougé)
@@ -434,6 +450,8 @@ static inline void processSample() {
     satVsat = SAT_V0 * powf(10.0f, -SAT_LOGSPAN * smDist);
     satMix  = (smDist < 0.01f) ? 0.0f
             : (smDist * SAT_MIX_RAMP > 1.0f ? 1.0f : smDist * SAT_MIX_RAMP);
+    satBias = SAT_ASYM * satVsat;
+    satHard = 1.0f + SAT_HARD * smDist;
 
     if (fabsf(smLow - eqLowCalc) > 0.002f) {
       calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));
@@ -463,10 +481,15 @@ static inline void processSample() {
   float y = biquadRun(&fHin,   x);    // Hin(s)
   y       = biquadRun(&fAmpli, y);    // Hampli(s,g)
 
-  // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz extrême ---
+  // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz Muse ---
   if (satMix > 0.0f) {
-    const float sat = tanhf(y / satVsat);   // écrêtage doux, sortie ±1
-    y += (sat - y) * satMix;                // fondu linéaire <-> saturé
+    // Écrêtage doux ASYMÉTRIQUE (harmoniques paires, caractère "lampe")
+    const float soft = tanhf((y + satBias) / satVsat) - SAT_BIAS_OUT;
+    // Écrêtage dur : re-amplifié puis tranché à ±1 (bords carrés du fuzz)
+    float hard = soft * satHard;
+    if (hard >  1.0f) hard =  1.0f;
+    if (hard < -1.0f) hard = -1.0f;
+    y += (hard - y) * satMix;               // fondu linéaire <-> saturé
   }
 
   // --- 4-5. Égaliseur 3 bandes ---
@@ -527,6 +550,8 @@ void setup() {
   calcHighShelf(&fHigh, EQ_HIGH_HZ, eqDb(smHigh)); eqHighCalc = smHigh;
   satVsat = SAT_V0 * powf(10.0f, -SAT_LOGSPAN * smDist);
   satMix  = (smDist * SAT_MIX_RAMP > 1.0f) ? 1.0f : smDist * SAT_MIX_RAMP;
+  satBias = SAT_ASYM * satVsat;
+  satHard = 1.0f + SAT_HARD * smDist;
 
   // --- WiFi / ESP-NOW ---
   WiFi.mode(WIFI_STA);

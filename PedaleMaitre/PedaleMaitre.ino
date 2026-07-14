@@ -161,6 +161,15 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </header>
 
 <div class="card">
+  <div class="row"><label>Pr&eacute;sets</label></div>
+  <div class="grid" style="grid-template-columns:repeat(3,1fr)" id="presets">
+    <button data-p="clean">CLEAN<small>cristallin</small></button>
+    <button data-p="crunch">CRUNCH<small>rock</small></button>
+    <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
+  </div>
+</div>
+
+<div class="card">
   <div class="ctl"><div class="row"><label for="g">Drive</label><output id="og">0.50</output></div>
     <input type="range" id="g" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">gain d'entr&eacute;e (pot R5 de la formule) &mdash; pousse l'&eacute;tage de saturation</div></div>
@@ -228,6 +237,18 @@ function push(){
 KEYS.forEach(function(k){
   $(k).addEventListener('input',function(){
     st[k]=+this.value;lastEdit=Date.now();paint();push();
+  });
+});
+var PRESETS={
+  clean:{g:0.30,d:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
+  crunch:{g:0.55,d:0.40,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
+  muse:{g:0.85,d:0.90,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60}
+};
+document.querySelectorAll('#presets button').forEach(function(bt){
+  bt.addEventListener('click',function(){
+    var p=PRESETS[this.getAttribute('data-p')];
+    for(var k in p)st[k]=p[k];
+    st.e=1;lastEdit=Date.now();paint();push();
   });
 });
 $('fsw').addEventListener('click',function(){
