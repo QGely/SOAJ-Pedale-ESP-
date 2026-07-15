@@ -169,6 +169,7 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
     <button data-p="crunch">CRUNCH<small>rock</small></button>
     <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
     <button data-p="foxx">fOXX<small>octave fuzz</small></button>
+    <button data-p="metal">METAL<small>serr&eacute; moderne</small></button>
   </div>
 </div>
 
@@ -249,7 +250,8 @@ var PRESETS={
   clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
   crunch:{g:0.55,d:0.40,o:0.00,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
   muse:{g:0.85,d:0.90,o:0.00,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60},
-  foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60}
+  foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60},
+  metal:{g:0.75,d:0.80,o:0.00,b:0.62,m:0.42,h:0.62,t:0.60,v:0.60}
 };
 document.querySelectorAll('#presets button').forEach(function(bt){
   bt.addEventListener('click',function(){

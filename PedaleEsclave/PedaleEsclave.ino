@@ -101,22 +101,30 @@
 #define OCT_HPF_HZ          10.0f     // liaison 10 µF : retire le DC de |u|
 #define OCT_GAIN            2.0f      // rattrape le niveau perdu au redressement
 
-// --- Saturation S(u,d) — voicing "Fuzz Factory / lampe" (type Muse) ---------
-// Double étage :
-//   1. Écrêtage doux ASYMÉTRIQUE : tanh décalé de SAT_ASYM·Vsat -> le haut et
-//      le bas de l'onde n'écrêtent pas pareil = harmoniques PAIRES, le son
-//      "lampe" (un tanh symétrique ne produit que des harmoniques impaires,
-//      son plus stérile). C'est le caractère du fuzz de Bellamy.
-//   2. Écrêtage dur : le résultat est re-amplifié (×1 à d=0 -> ×3.2 à d=1)
-//      et tranché net à ±1 -> bords carrés, son fuzz/metal dense.
+// --- Saturation S(u,d) — voicing HIGH-GAIN MODERNE (serré, sans fizz) -------
+// Trois ingrédients (montage des amplis metal modernes) :
+//   0. AVANT l'écrêtage : passe-haut de resserrage TIGHT_HPF_HZ — retire le
+//      bas qui "baveait" dans la disto, l'attaque devient nette et percutante.
+//   1. Écrêtage doux ASYMÉTRIQUE : tanh décalé de SAT_ASYM·Vsat -> harmoniques
+//      PAIRES, caractère lampe.
+//   2. Deuxième étage tanh (au lieu de l'ancien écrêtage dur tranché) :
+//      re-amplifié ×(1 + 2.2·d) puis tanh -> aussi agressif, mais SANS angle
+//      dur. L'angle net de l'ancien clip créait de l'aliasing (fréquences
+//      inharmoniques dissonantes) : c'était le "je-ne-sais-quoi" déplaisant
+//      sur les notes seules.
+//   3. APRÈS l'égaliseur : passe-bas CAB_LPF_HZ ordre 2 = simulation de
+//      haut-parleur guitare (un vrai HP coupe ~5,5 kHz ; sans lui, tout le
+//      grésil numérique au-dessus partait dans l'ampli).
 // Seuil : Vsat = SAT_V0 · 10^(−SAT_LOGSPAN·d)
-//   d=0 -> ±2.0 (aucun écrêtage audible), d=1 -> ±0.01 (fuzz extrême, rapport 200)
+//   d=0 -> ±2.0 (aucun écrêtage audible), d=1 -> ±0.01 (extrême, rapport 200)
 #define SAT_V0              2.0f
 #define SAT_LOGSPAN         2.3f
-#define SAT_ASYM            0.28f     // décalage d'asymétrie (en fractions de Vsat)
-#define SAT_HARD            2.2f      // poussée vers l'écrêtage dur à d max
-// Fondu linéaire->saturé sur le premier quart de la course (continuité à d=0)
-#define SAT_MIX_RAMP        4.0f
+#define SAT_ASYM            0.28f     // décalage d'asymétrie (fractions de Vsat)
+#define SAT_HARD            2.2f      // poussée du 2e étage tanh à d max
+#define SAT_MIX_RAMP        4.0f      // fondu linéaire->saturé (continuité à d=0)
+#define TIGHT_HPF_HZ        140.0f    // resserrage pré-écrêtage
+#define CAB_LPF_HZ          5500.0f   // simulation haut-parleur (post-EQ)
+#define CAB_Q               0.707f    // Butterworth
 
 // --- Égaliseur 3 bandes (formules RBJ "Audio EQ Cookbook") ------------------
 #define EQ_LOW_HZ           100.0f    // low-shelf
@@ -133,11 +141,13 @@
 // de fermeture et on entend le bruit "redescendre").
 // Amplitudes normalisées : une guitare directe fait ~0.12 en crête (avec
 // INPUT_GAIN 2), le bruit ADC ~0.001-0.003.
-#define GATE_LOW            0.003f    // en dessous : fermé
-#define GATE_HIGH           0.009f    // au-dessus : complètement ouvert
-#define GATE_DRIVE_SCALE    2.0f      // seuils x(1 + 2·G ...)
-#define GATE_DIST_SCALE     2.0f      //        ...  + 2·D) : plus de gain/fuzz
-                                      // = fermeture plus tôt (règle high-gain)
+#define GATE_LOW            0.002f    // en dessous : fermé
+#define GATE_HIGH           0.006f    // au-dessus : complètement ouvert
+#define GATE_DRIVE_SCALE    1.5f      // seuils x(1 + 1.5·G ...)
+#define GATE_DIST_SCALE     1.0f      //        ...  + 1·D)
+                                      // Volontairement plus doux qu'avant : la
+                                      // corde de MI AIGU (la plus faible) doit
+                                      // sonner même jouée doucement à fort gain
 #define ENV_ATTACK          0.01f     // montée d'enveloppe ~2,5 ms (un parasite
                                       // d'UN échantillon n'ouvre pas le gate)
 #define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
@@ -234,10 +244,25 @@ static void bilinear2(Biquad *f,
   f->a1 = A1 * inv;  f->a2 = A2 * inv;
 }
 
+// Transformation bilinéaire du 1er ORDRE : H(s) = (n0 + n1·s)/(d0 + d1·s).
+// Un 1er ordre passé dans bilinear2 (avec n2=d2=0) crée une paire pôle/zéro
+// EXACTEMENT sur le cercle unité en z=−1 : annulation parfaite en arithmétique
+// exacte, mais fragile en float32 sur de longues durées. Cette version pose
+// un vrai filtre du 1er ordre : b2 = a2 = 0, aucun mode parasite.
+static void bilinear1(Biquad *f, float n0, float n1, float d0, float d1) {
+  const float K   = 2.0f * (float)SAMPLE_RATE_HZ;
+  const float A0  = d0 + d1 * K;
+  const float inv = 1.0f / A0;
+  f->b0 = (n0 + n1 * K) * inv;
+  f->b1 = (n0 - n1 * K) * inv;
+  f->b2 = 0.0f;
+  f->a1 = (d0 - d1 * K) * inv;
+  f->a2 = 0.0f;
+}
+
 // --- Étage 1 : Hin(s) = 0.47·s / (1 + 0.4747·s) ----------------------------
 static void calcHin(Biquad *f) {
-  bilinear2(f, 0.0f, 0.47f, 0.0f,
-               1.0f, 0.4747f, 0.0f);
+  bilinear1(f, 0.0f, 0.47f, 1.0f, 0.4747f);
 }
 
 // --- Étage 2 : Hampli(s,g) = 1 + 0.11·g·s / ((1+5e-5·g·s)(1+2.2e-4·s)) -----
@@ -251,6 +276,9 @@ static void calcAmpli(Biquad *f, float g) {
 
 // --- Étage 6 : Hsortie(s,t,v) -----------------------------------------------
 static void calcSortie(Biquad *f, float t, float v) {
+  // t borné à 0.02 : à t=0 exactement, d2 s'annule et le biquad dégénère en
+  // 1er ordre avec un pôle sur le cercle unité (cf. bilinear1). Inaudible.
+  if (t < 0.02f) t = 0.02f;
   const float d1 = 0.11242f - 0.00022f * t;
   const float d2 = 2.42e-5f * t - 2.2e-6f * t * t;
   bilinear2(f, 0.0f, 0.1f * v, 0.0f,
@@ -336,9 +364,11 @@ static inline float eqDb(float p) {
 static float dcOffset = 2048.0f;
 static Biquad fHin    = {0};
 static Biquad fAmpli  = {0};
+static Biquad fTight  = {0};   // passe-haut de resserrage pré-écrêtage (140 Hz)
 static Biquad fLow    = {0};
 static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
+static Biquad fCab    = {0};   // passe-bas "haut-parleur" post-EQ (5,5 kHz)
 static Biquad fSortie = {0};
 static float  quantErr = 0.0f;       // mise en forme du bruit DAC
 static float  envelope = 0.0f;       // suiveur d'enveloppe du gate
@@ -554,6 +584,10 @@ static inline void processSample() {
   float y = biquadRun(&fHin,   x) * gateGain;   // Hin(s)
   y       = biquadRun(&fAmpli, y);              // Hampli(s,g)
 
+  // --- 2a. Resserrage pré-écrêtage : passe-haut 140 Hz sur la voie saturée
+  //     (le bas "bave" dans la disto ; l'EQ Low peut le remettre APRÈS) ---
+  y = biquadRun(&fTight, y);
+
   // --- 2b. Octave O(u,o) — redressement double alternance (fOXX) ---
   // |u| ne contient que les harmoniques PAIRS -> la fondamentale disparaît,
   // remplacée par l'octave supérieure. Le passe-haut émule la liaison 10 µF.
@@ -565,14 +599,14 @@ static inline void processSample() {
     y += smOct * (OCT_GAIN * rectAc - y);       // fondu direct <-> octave
   }
 
-  // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz Muse ---
+  // --- 3. Saturation S(u,d) : double tanh en cascade (agressif SANS fizz) ---
   if (satMix > 0.0f) {
-    // Écrêtage doux ASYMÉTRIQUE (harmoniques paires, caractère "lampe")
+    // Étage 1 : écrêtage doux ASYMÉTRIQUE (harmoniques paires, "lampe")
     const float soft = tanhf((y + satBias) / satVsat) - SAT_BIAS_OUT;
-    // Écrêtage dur : re-amplifié puis tranché à ±1 (bords carrés du fuzz)
-    float hard = soft * satHard;
-    if (hard >  1.0f) hard =  1.0f;
-    if (hard < -1.0f) hard = -1.0f;
+    // Étage 2 : re-amplifié puis tanh — aussi dense qu'un clip dur, mais sans
+    // angle net donc quasi pas d'aliasing (l'ancien clip dur créait des
+    // fréquences inharmoniques dissonantes sur les notes seules)
+    const float hard = tanhf(soft * satHard);
     y += (hard - y) * satMix;               // fondu linéaire <-> saturé
   }
 
@@ -580,6 +614,11 @@ static inline void processSample() {
   y = biquadRun(&fLow,  y);           // low-shelf  100 Hz
   y = biquadRun(&fMid,  y);           // peak       700 Hz
   y = biquadRun(&fHigh, y);           // high-shelf 3,2 kHz
+
+  // --- 5b. Simulation haut-parleur : passe-bas 5,5 kHz ordre 2 ---
+  // Un HP guitare ne reproduit rien au-dessus de ~5,5 kHz : ce filtre retire
+  // le grésil numérique aigu qui rendait les notes seules désagréables.
+  y = biquadRun(&fCab, y);
 
   // --- 6. Tone + volume ---
   y = biquadRun(&fSortie, y);         // Hsortie(s,t,v)
@@ -639,6 +678,16 @@ void setup() {
   calcHin(&fHin);
   calcAmpli(&fAmpli, driveTaper(smGain));
   calcSortie(&fSortie, smTone, smVolume);
+  // Resserrage pré-écrêtage : passe-haut 1er ordre H(s) = s·τ/(1+s·τ)
+  {
+    const float tau = 1.0f / (2.0f * (float)M_PI * TIGHT_HPF_HZ);
+    bilinear1(&fTight, 0.0f, tau, 1.0f, tau);
+  }
+  // Simulation haut-parleur : passe-bas Butterworth H(s) = 1/(1 + s/(Q·w0) + s²/w0²)
+  {
+    const float w0 = 2.0f * (float)M_PI * CAB_LPF_HZ;
+    bilinear2(&fCab, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * w0), 1.0f / (w0 * w0));
+  }
   calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));    eqLowCalc  = smLow;
   calcPeak(&fMid, EQ_MID_HZ, EQ_MID_Q, eqDb(smMid)); eqMidCalc = smMid;
   calcHighShelf(&fHigh, EQ_HIGH_HZ, eqDb(smHigh)); eqHighCalc = smHigh;
