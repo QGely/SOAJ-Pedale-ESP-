@@ -17,6 +17,10 @@
  *    |u| ne contient que les harmoniques pairs -> fondamentale remplacée
  *    par l'octave supérieure (|sin wt| = 2/π − 4/π·Σ cos(2k·wt)/(4k²−1)).
  *
+ *  + CLEAN PUR : à Dist = 0, le signal ne traverse AUCUN étage — sortie =
+ *    x · CLEAN_GAIN · Volume, c'est tout. Le pot Dist fond continûment de ce
+ *    chemin brut (0) vers la chaîne traitée complète (~0.25 et au-delà).
+ *
  *  + NOISE GATE (indispensable en high-gain : sans lui, guitare à volume 0,
  *    le bruit ADC est normalisé vers ±1 par le fuzz -> souffle constant).
  *    Enveloppe mesurée sur l'entrée ; gain du gate appliqué AVANT l'étage de
@@ -86,6 +90,13 @@
 
 // Bypass : rattrapage de niveau quand l'effet est coupé
 #define BYPASS_GAIN         8.0f
+
+// CLEAN pur : à Dist = 0, le signal ne traverse AUCUN étage (ni filtre, ni
+// EQ, ni tone) — seulement ce rehaussement, dosé par le pot Volume :
+//   y = x · CLEAN_GAIN · V   (V=0.5 -> x8, même niveau que le bypass)
+// Le pot Dist fait le fondu continu entre ce chemin pur (0) et la chaîne
+// complète traitée (à partir de ~0.25).
+#define CLEAN_GAIN          16.0f
 
 // Course du potentiomètre DRIVE (1 = logarithmique, 0 = linéaire fidèle)
 #define DRIVE_TAPER_LOG     1
@@ -645,6 +656,13 @@ static inline void processSample() {
   //     d'entrée, sans cette 2e application on entendrait le bruit
   //     "redescendre" à chaque fin de note (atténuation au carré) ---
   y *= gateGain;
+
+  // --- CLEAN pur : à Dist = 0 le signal ne subit AUCUNE modification,
+  //     seulement le rehaussement CLEAN_GAIN dosé par le pot Volume.
+  //     satMix (0 -> 1 sur le premier quart du pot Dist) fait le fondu
+  //     continu entre ce chemin brut et la chaîne traitée complète. ---
+  const float clean = x * CLEAN_GAIN * smVolume;
+  y = clean + (y - clean) * satMix;
 
   // --- Bypass en fondu : mélange signal direct <-> signal traité ---
   const float dry = x * BYPASS_GAIN;

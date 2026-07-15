@@ -179,7 +179,7 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
     <div class="hint">gain d'entr&eacute;e (pot R5 de la formule) &mdash; pousse l'&eacute;tage de saturation</div></div>
   <div class="ctl"><div class="row"><label for="d">Dist</label><output id="od">0.30</output></div>
     <input type="range" id="d" min="0" max="1" step="0.01" value="0.3">
-    <div class="hint">saturation S(u,d) &mdash; 0 = z&eacute;ro distorsion &rarr; 1 = fuzz extr&ecirc;me</div></div>
+    <div class="hint">0 = CLEAN PUR (signal brut, aucun traitement) &rarr; 1 = fuzz extr&ecirc;me</div></div>
   <div class="ctl"><div class="row"><label for="o">Octave</label><output id="oo">0.00</output></div>
     <input type="range" id="o" min="0" max="1" step="0.01" value="0">
     <div class="hint">fOXX Tone Machine &mdash; redressement |u| : la fondamentale devient l'octave sup&eacute;rieure</div></div>
