@@ -163,6 +163,14 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </header>
 
 <div class="card">
+  <div class="row"><label>P&eacute;dale connect&eacute;e</label></div>
+  <div class="grid" style="grid-template-columns:repeat(2,1fr)" id="pedsel">
+    <button data-m="satu" class="sel">SATU<small>fuzz / EQ / octave</small></button>
+    <button data-m="psyche">PSYCHE<small>disto + r&eacute;verbe</small></button>
+  </div>
+</div>
+
+<div class="card">
   <div class="row"><label>Pr&eacute;sets</label></div>
   <div class="grid" id="presets">
     <button data-p="clean">CLEAN<small>cristallin</small></button>
@@ -170,6 +178,7 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
     <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
     <button data-p="foxx">fOXX<small>octave fuzz</small></button>
     <button data-p="metal">METAL<small>serr&eacute; moderne</small></button>
+    <button data-p="psyche">PSYCHE<small>p&eacute;dale r&eacute;verbe</small></button>
   </div>
 </div>
 
@@ -180,21 +189,21 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
   <div class="ctl"><div class="row"><label for="d">Dist</label><output id="od">0.30</output></div>
     <input type="range" id="d" min="0" max="1" step="0.01" value="0.3">
     <div class="hint">0 = CLEAN PUR (signal brut, aucun traitement) &rarr; 1 = fuzz extr&ecirc;me</div></div>
-  <div class="ctl"><div class="row"><label for="o">Octave</label><output id="oo">0.00</output></div>
+  <div class="ctl"><div class="row"><label for="o" id="lb_o">Octave</label><output id="oo">0.00</output></div>
     <input type="range" id="o" min="0" max="1" step="0.01" value="0">
-    <div class="hint">fOXX Tone Machine &mdash; redressement |u| : la fondamentale devient l'octave sup&eacute;rieure</div></div>
+    <div class="hint" id="hi_o">fOXX Tone Machine &mdash; redressement |u| : la fondamentale devient l'octave sup&eacute;rieure</div></div>
 </div>
 
 <div class="card">
-  <div class="ctl"><div class="row"><label for="b">Low</label><output id="ob">0.50</output></div>
+  <div class="ctl"><div class="row"><label for="b" id="lb_b">Low</label><output id="ob">0.50</output></div>
     <input type="range" id="b" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">graves 100 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
-  <div class="ctl"><div class="row"><label for="m">Mid</label><output id="om">0.50</output></div>
+    <div class="hint" id="hi_b">graves 100 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="m" id="lb_m">Mid</label><output id="om">0.50</output></div>
     <input type="range" id="m" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">m&eacute;diums 700 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
-  <div class="ctl"><div class="row"><label for="h">High</label><output id="oh">0.50</output></div>
+    <div class="hint" id="hi_m">m&eacute;diums 700 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="h" id="lb_h">High</label><output id="oh">0.50</output></div>
     <input type="range" id="h" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">aigus 3,2 kHz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+    <div class="hint" id="hi_h">aigus 3,2 kHz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
 </div>
 
 <div class="card">
@@ -246,18 +255,43 @@ KEYS.forEach(function(k){
     st[k]=+this.value;lastEdit=Date.now();paint();push();
   });
 });
+var LBL={
+ satu:{o:['Octave','fOXX Tone Machine — redressement |u| : la fondamentale devient l\'octave supérieure'],
+       b:['Low','graves 100 Hz — 0.5 = plat, ±12 dB'],
+       m:['Mid','médiums 700 Hz — 0.5 = plat, ±12 dB'],
+       h:['High','aigus 3,2 kHz — 0.5 = plat, ±12 dB']},
+ psyche:{o:['Reverb','mix de réverbération — 0 = sec, 1 = cathédrale'],
+       b:['Decay','durée de la queue de réverbe — 0 = courte, 1 = très longue'],
+       m:['Warble','pulsation psychédélique de la réverbe (2 LFO lents)'],
+       h:['Bright','brillance de la queue de réverbe']}
+};
+function relabel(mode){
+  ['o','b','m','h'].forEach(function(k){
+    $('lb_'+k).textContent=LBL[mode][k][0];
+    $('hi_'+k).textContent=LBL[mode][k][1];
+  });
+  var bs=document.querySelectorAll('#pedsel button');
+  for(var i=0;i<bs.length;i++)bs[i].className=(bs[i].getAttribute('data-m')==mode)?'sel':'';
+}
+document.querySelectorAll('#pedsel button').forEach(function(bt){
+  bt.addEventListener('click',function(){relabel(this.getAttribute('data-m'));});
+});
 var PRESETS={
   clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
   crunch:{g:0.55,d:0.40,o:0.00,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
   muse:{g:0.85,d:0.90,o:0.00,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60},
   foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60},
-  metal:{g:0.75,d:0.80,o:0.00,b:0.62,m:0.42,h:0.62,t:0.60,v:0.60}
+  metal:{g:0.75,d:0.80,o:0.00,b:0.62,m:0.42,h:0.62,t:0.60,v:0.60},
+  psyche:{g:0.45,d:0.50,o:0.70,b:0.65,m:0.50,h:0.55,t:0.65,v:0.60}
 };
 document.querySelectorAll('#presets button').forEach(function(bt){
   bt.addEventListener('click',function(){
-    var p=PRESETS[this.getAttribute('data-p')];
+    var id=this.getAttribute('data-p');
+    var p=PRESETS[id];
     for(var k in p)st[k]=p[k];
-    st.e=1;lastEdit=Date.now();paint();push();
+    st.e=1;lastEdit=Date.now();
+    relabel(id=='psyche'?'psyche':'satu');
+    paint();push();
   });
 });
 $('fsw').addEventListener('click',function(){

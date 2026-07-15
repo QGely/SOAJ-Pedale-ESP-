@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  *  SOAJ - Pédale d'effet guitare ESP32
- *  PedaleEsclave.ino  —  ESP32 n°N : Esclave (traitement audio local)
+ *  PedaleEsclaveSatu.ino  —  ESP32 esclave SATU (saturation/fuzz/EQ/octave)
  * ============================================================================
  *
  *  Rôle :
@@ -691,7 +691,7 @@ static inline void processSample() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ Pédale — ESCLAVE v5 (saturation + EQ + octave fOXX) ===");
+  Serial.println("\n=== SOAJ Pédale — ESCLAVE SATU (saturation + EQ + octave fOXX) ===");
 
   // --- ADC ---
 #ifdef USE_LEGACY_ADC
