@@ -8,9 +8,14 @@
  *    - Reçoit UNIQUEMENT des paramètres du maître via ESP-NOW.
  *    - Lit la guitare sur l'ADC (GPIO34), traite, sort sur le DAC (GPIO25).
  *
- *  Formule complète (7 potentiomètres g, d, b, m, h, t, v) :
+ *  Formule complète (8 potentiomètres g, d, o, b, m, h, t, v) :
  *
- *    y = Hsortie(s,t,v) · EQh(s,h) · EQm(s,m) · EQb(s,b) · S( Hampli(s,g) · Hin(s) · x , d )
+ *    y = Hsortie(s,t,v) · EQh(s,h) · EQm(s,m) · EQb(s,b) · S( O( Hampli(s,g) · Hin(s) · x , o ) , d )
+ *
+ *  + OCTAVE O(u,o) — étage fOXX Tone Machine (redressement double alternance) :
+ *    O(u,o) = u + o·( 2·HPF₁₀Hz(|u|) − u )
+ *    |u| ne contient que les harmoniques pairs -> fondamentale remplacée
+ *    par l'octave supérieure (|sin wt| = 2/π − 4/π·Σ cos(2k·wt)/(4k²−1)).
  *
  *  + NOISE GATE (indispensable en high-gain : sans lui, guitare à volume 0,
  *    le bruit ADC est normalisé vers ±1 par le fuzz -> souffle constant).
@@ -85,6 +90,17 @@
 // Course du potentiomètre DRIVE (1 = logarithmique, 0 = linéaire fidèle)
 #define DRIVE_TAPER_LOG     1
 
+// --- Octave O(u,o) — étage fOXX Tone Machine ---------------------------------
+// Dans la fOXX, Q2 monté en déphaseur (collecteur 4K7 / émetteur 4K7) sort
+// deux copies du signal en opposition de phase ; deux diodes germanium n'en
+// gardent chacune qu'une demi-alternance ; leur somme = REDRESSEMENT DOUBLE
+// ALTERNANCE : u -> |u|. Comme |sin(wt)| ne contient QUE les harmoniques
+// pairs (2w, 4w...), la fondamentale disparaît : c'est l'octave supérieure.
+// La liaison 10 µF retire la composante continue du signal redressé.
+//   O(u,o) = u + o·( OCT_GAIN·HPF(|u|) − u )   (o=0 : inchangé, o=1 : plein octaver)
+#define OCT_HPF_HZ          10.0f     // liaison 10 µF : retire le DC de |u|
+#define OCT_GAIN            2.0f      // rattrape le niveau perdu au redressement
+
 // --- Saturation S(u,d) — voicing "Fuzz Factory / lampe" (type Muse) ---------
 // Double étage :
 //   1. Écrêtage doux ASYMÉTRIQUE : tanh décalé de SAT_ASYM·Vsat -> le haut et
@@ -158,6 +174,7 @@ typedef struct __attribute__((packed)) {
   uint32_t magic;
   float    gain;      // g : drive (0..1)
   float    dist;      // d : saturation (0 = aucune .. 1 = extrême)
+  float    oct;       // o : octave fOXX (0 = off .. 1 = plein octaver)
   float    low;       // b : graves  (0..1, 0.5 = plat, ±12 dB)
   float    mid;       // m : médiums (0..1, 0.5 = plat, ±12 dB)
   float    high;      // h : aigus   (0..1, 0.5 = plat, ±12 dB)
@@ -169,6 +186,7 @@ typedef struct __attribute__((packed)) {
 // Cibles reçues par radio (défauts si le maître n'est pas encore là)
 static volatile float tgtGain   = 0.5f;
 static volatile float tgtDist   = 0.3f;   // léger crunch par défaut
+static volatile float tgtOct    = 0.0f;   // octave coupée par défaut
 static volatile float tgtLow    = 0.5f;   // EQ plat
 static volatile float tgtMid    = 0.5f;
 static volatile float tgtHigh   = 0.5f;
@@ -326,9 +344,15 @@ static float  quantErr = 0.0f;       // mise en forme du bruit DAC
 static float  envelope = 0.0f;       // suiveur d'enveloppe du gate
 static float  gateGain = 0.0f;       // gain du gate (0..1)
 
+// Étage octave fOXX : passe-haut 1 pôle sur le signal redressé |u|
+// (émule la liaison 10 µF qui retire la composante continue 2/π)
+static float  octPrevX = 0.0f, octPrevY = 0.0f;
+static float  octA     = 0.0f;       // coefficient du passe-haut (calculé au setup)
+
 // Paramètres lissés
 static float smGain    = 0.5f;
 static float smDist    = 0.3f;
+static float smOct     = 0.0f;
 static float smLow     = 0.5f;
 static float smMid     = 0.5f;
 static float smHigh    = 0.5f;
@@ -385,6 +409,7 @@ static inline int readGuitarAdc() {
 static void applyParams(const PedalParams *p) {
   tgtGain   = clampf(p->gain,   GAIN_MIN, GAIN_MAX);
   tgtDist   = clampf(p->dist,   0.0f, 1.0f);
+  tgtOct    = clampf(p->oct,    0.0f, 1.0f);
   tgtLow    = clampf(p->low,    0.0f, 1.0f);
   tgtMid    = clampf(p->mid,    0.0f, 1.0f);
   tgtHigh   = clampf(p->high,   0.0f, 1.0f);
@@ -426,10 +451,10 @@ static inline void meterTick(float raw) {
                     mPeakIn);
     } else {
       Serial.printf("[Metre] entree: %.0f pas ADC | env=%.4f gate=%s(%.2f) | "
-                    "sortie DAC: +/-%d pas | G=%.2f D=%.2f (Vsat=%.3f) "
+                    "sortie DAC: +/-%d pas | G=%.2f D=%.2f (Vsat=%.3f) O=%.2f "
                     "B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
                     mPeakIn, envelope, (gateGain > 0.5f) ? "OUVERT" : "ferme",
-                    gateGain, mPeakOut, smGain, smDist, satVsat,
+                    gateGain, mPeakOut, smGain, smDist, satVsat, smOct,
                     smLow, smMid, smHigh, smTone, smVolume, smEffect);
     }
     mPeakIn  = 0.0f;
@@ -462,6 +487,7 @@ static inline void processSample() {
   // Lissage des paramètres (progression douce, pas de craquement)
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
   smDist   += PARAM_SMOOTH * (tgtDist   - smDist);
+  smOct    += PARAM_SMOOTH * (tgtOct    - smOct);
   smLow    += PARAM_SMOOTH * (tgtLow    - smLow);
   smMid    += PARAM_SMOOTH * (tgtMid    - smMid);
   smHigh   += PARAM_SMOOTH * (tgtHigh   - smHigh);
@@ -528,6 +554,17 @@ static inline void processSample() {
   float y = biquadRun(&fHin,   x) * gateGain;   // Hin(s)
   y       = biquadRun(&fAmpli, y);              // Hampli(s,g)
 
+  // --- 2b. Octave O(u,o) — redressement double alternance (fOXX) ---
+  // |u| ne contient que les harmoniques PAIRS -> la fondamentale disparaît,
+  // remplacée par l'octave supérieure. Le passe-haut émule la liaison 10 µF.
+  if (smOct > 0.005f) {
+    const float rect   = fabsf(y);
+    const float rectAc = octA * (octPrevY + rect - octPrevX);
+    octPrevX = rect;
+    octPrevY = rectAc;
+    y += smOct * (OCT_GAIN * rectAc - y);       // fondu direct <-> octave
+  }
+
   // --- 3. Saturation S(u,d) : de strictement linéaire à fuzz Muse ---
   if (satMix > 0.0f) {
     // Écrêtage doux ASYMÉTRIQUE (harmoniques paires, caractère "lampe")
@@ -579,7 +616,7 @@ static inline void processSample() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ Pédale — ESCLAVE v4 (formule + saturation + EQ 3 bandes) ===");
+  Serial.println("\n=== SOAJ Pédale — ESCLAVE v5 (saturation + EQ + octave fOXX) ===");
 
   // --- ADC ---
 #ifdef USE_LEGACY_ADC
@@ -594,6 +631,11 @@ void setup() {
   dacWrite(PIN_AUDIO_OUT, 128);
 
   // --- Coefficients initiaux de tous les étages ---
+  // Passe-haut de l'étage octave : y = a·(yPrev + x − xPrev), a = rc/(rc+dt)
+  {
+    const float rc = 1.0f / (2.0f * (float)M_PI * OCT_HPF_HZ);
+    octA = rc / (rc + DT_SEC);
+  }
   calcHin(&fHin);
   calcAmpli(&fAmpli, driveTaper(smGain));
   calcSortie(&fSortie, smTone, smVolume);

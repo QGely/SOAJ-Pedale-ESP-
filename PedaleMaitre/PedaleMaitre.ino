@@ -66,6 +66,7 @@ typedef struct __attribute__((packed)) {
   uint32_t magic;
   float    gain;      // g : drive (0..1)
   float    dist;      // d : saturation (0 = aucune .. 1 = extrême)
+  float    oct;       // o : octave fOXX (0 = off .. 1 = plein octaver)
   float    low;       // b : graves  (0..1, 0.5 = plat, ±12 dB)
   float    mid;       // m : médiums (0..1, 0.5 = plat, ±12 dB)
   float    high;      // h : aigus   (0..1, 0.5 = plat, ±12 dB)
@@ -79,6 +80,7 @@ static PedalParams params = {
   PARAMS_MAGIC,
   0.5f,    // drive
   0.3f,    // dist : léger crunch
+  0.0f,    // oct : octave coupée
   0.5f,    // low  (plat)
   0.5f,    // mid  (plat)
   0.5f,    // high (plat)
@@ -162,10 +164,11 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 
 <div class="card">
   <div class="row"><label>Pr&eacute;sets</label></div>
-  <div class="grid" style="grid-template-columns:repeat(3,1fr)" id="presets">
+  <div class="grid" id="presets">
     <button data-p="clean">CLEAN<small>cristallin</small></button>
     <button data-p="crunch">CRUNCH<small>rock</small></button>
     <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
+    <button data-p="foxx">fOXX<small>octave fuzz</small></button>
   </div>
 </div>
 
@@ -176,6 +179,9 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
   <div class="ctl"><div class="row"><label for="d">Dist</label><output id="od">0.30</output></div>
     <input type="range" id="d" min="0" max="1" step="0.01" value="0.3">
     <div class="hint">saturation S(u,d) &mdash; 0 = z&eacute;ro distorsion &rarr; 1 = fuzz extr&ecirc;me</div></div>
+  <div class="ctl"><div class="row"><label for="o">Octave</label><output id="oo">0.00</output></div>
+    <input type="range" id="o" min="0" max="1" step="0.01" value="0">
+    <div class="hint">fOXX Tone Machine &mdash; redressement |u| : la fondamentale devient l'octave sup&eacute;rieure</div></div>
 </div>
 
 <div class="card">
@@ -207,8 +213,8 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </div>
 
 <script>
-var KEYS=['g','d','b','m','h','t','v'];
-var st={g:0.5,d:0.3,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
+var KEYS=['g','d','o','b','m','h','t','v'];
+var st={g:0.5,d:0.3,o:0,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
 var timer=null,lastEdit=0;
 function $(id){return document.getElementById(id)}
 function paint(){
@@ -240,9 +246,10 @@ KEYS.forEach(function(k){
   });
 });
 var PRESETS={
-  clean:{g:0.30,d:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
-  crunch:{g:0.55,d:0.40,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
-  muse:{g:0.85,d:0.90,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60}
+  clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
+  crunch:{g:0.55,d:0.40,o:0.00,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
+  muse:{g:0.85,d:0.90,o:0.00,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60},
+  foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60}
 };
 document.querySelectorAll('#presets button').forEach(function(bt){
   bt.addEventListener('click',function(){
@@ -282,8 +289,8 @@ static void sendParamsEspNow() {
 }
 
 static void logParams(const char *src) {
-  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
-                src, params.gain, params.dist, params.low, params.mid,
+  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f O=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
+                src, params.gain, params.dist, params.oct, params.low, params.mid,
                 params.high, params.tone, params.volume, params.effectOn);
 }
 
@@ -294,14 +301,14 @@ static void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// GET /api/get  ->  {"g":0.50,"d":0.30,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
+// GET /api/get -> {"g":0.50,"d":0.30,"o":0.00,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
 static void handleApiGet() {
-  char buf[144];
+  char buf[160];
   snprintf(buf, sizeof(buf),
-           "{\"g\":%.2f,\"d\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
+           "{\"g\":%.2f,\"d\":%.2f,\"o\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
            "\"t\":%.2f,\"v\":%.2f,\"e\":%d}",
-           params.gain, params.dist, params.low, params.mid, params.high,
-           params.tone, params.volume, params.effectOn);
+           params.gain, params.dist, params.oct, params.low, params.mid,
+           params.high, params.tone, params.volume, params.effectOn);
   server.send(200, "application/json", buf);
 }
 
@@ -310,6 +317,7 @@ static void handleApiSet() {
   bool changed = false;
   if (server.hasArg("g")) { params.gain   = clampf(server.arg("g").toFloat(), GAIN_MIN, GAIN_MAX);     changed = true; }
   if (server.hasArg("d")) { params.dist   = clampf(server.arg("d").toFloat(), 0.0f, 1.0f);             changed = true; }
+  if (server.hasArg("o")) { params.oct    = clampf(server.arg("o").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("b")) { params.low    = clampf(server.arg("b").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("m")) { params.mid    = clampf(server.arg("m").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("h")) { params.high   = clampf(server.arg("h").toFloat(), 0.0f, 1.0f);             changed = true; }
@@ -356,6 +364,7 @@ static void parseCommand(const String &cmd) {
     switch (key) {
       case 'G': params.gain   = clampf(v, GAIN_MIN, GAIN_MAX);       changed = true; break;
       case 'D': params.dist   = clampf(v, 0.0f, 1.0f);               changed = true; break;
+      case 'O': params.oct    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'B': params.low    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'M': params.mid    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'H': params.high   = clampf(v, 0.0f, 1.0f);               changed = true; break;
@@ -428,7 +437,7 @@ void setup() {
   server.begin();
 
   Serial.println("[Web] Serveur démarré. Connectez le téléphone au WiFi puis ouvrez http://192.168.4.1");
-  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
+  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;O:1;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
 }
 
 // ---------------------------------------------------------------------------
