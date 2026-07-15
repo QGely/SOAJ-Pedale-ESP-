@@ -150,9 +150,15 @@
                                       // sonner même jouée doucement à fort gain
 #define ENV_ATTACK          0.01f     // montée d'enveloppe ~2,5 ms (un parasite
                                       // d'UN échantillon n'ouvre pas le gate)
-#define ENV_RELEASE         0.0005f   // descente lente (~100 ms)
+#define ENV_RELEASE         0.002f    // descente RAPIDE (~25 ms) : l'enveloppe
+                                      // suit la vraie fin de note au lieu de
+                                      // traîner (la traîne = la "courbe qui
+                                      // descend" audible après chaque note)
 #define GATE_OPEN_COEF      0.010f    // ouverture ~5 ms
-#define GATE_CLOSE_COEF     0.0008f   // fermeture douce ~60 ms (garde le sustain)
+#define GATE_CLOSE_COEF     0.004f    // fermeture FRANCHE ~12 ms : pas de fondu
+                                      // audible, la note s'arrête c'est tout
+#define GATE_SNAP           0.005f    // en dessous : gain collé à 0 strict
+                                      // (sortie DAC exactement au repos)
 
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
@@ -575,10 +581,22 @@ static inline void processSample() {
   float gateTarget;
   if      (envelope <= gLow)  gateTarget = 0.0f;
   else if (envelope >= gHigh) gateTarget = 1.0f;
-  else    gateTarget = (envelope - gLow) / (gHigh - gLow);
+  else {
+    // Pente d'EXPANDEUR (au carré) : dès que la note faiblit, l'atténuation
+    // accélère — la fin de note s'arrête net au lieu de descendre en traînant
+    const float lin = (envelope - gLow) / (gHigh - gLow);
+    gateTarget = lin * lin;
+  }
 
   gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : GATE_CLOSE_COEF)
               * (gateTarget - gateGain);
+  // Verrou : sous GATE_SNAP le gain est collé à 0 STRICT -> aucune note en
+  // cours = aucune sortie du tout (le DAC reste exactement au repos, même
+  // le dither de quantification est remis à zéro)
+  if (gateGain < GATE_SNAP && gateTarget <= 0.0f) {
+    gateGain = 0.0f;
+    quantErr = 0.0f;
+  }
 
   // --- 1-2. Étages linéaires d'entrée (gate appliqué AVANT le gain) ---
   float y = biquadRun(&fHin,   x) * gateGain;   // Hin(s)
