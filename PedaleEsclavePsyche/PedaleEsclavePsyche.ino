@@ -140,6 +140,8 @@ typedef struct __attribute__((packed)) {
   float    tone;      // Tone
   float    volume;    // Volume
   uint8_t  effectOn;
+  uint8_t  profil;    // profil de saturation de la pédale SATU — IGNORÉ ici,
+                      // présent pour garder la taille du paquet identique
 } PedalParams;
 
 static volatile float tgtGain   = 0.4f;

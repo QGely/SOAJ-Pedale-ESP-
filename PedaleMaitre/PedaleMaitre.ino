@@ -73,7 +73,12 @@ typedef struct __attribute__((packed)) {
   float    tone;      // t : tonalité (0..1)
   float    volume;    // v : volume (0..1)
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
+  uint8_t  profil;    // p : profil de saturation (0 = circuit SOAJ,
+                      //     1 = TS9, 2 = RAT, 3 = BIG MUFF — pédale SATU)
 } PedalParams;
+
+// Nombre de profils embarqués dans l'esclave SATU (voir profils_pedales.h)
+#define NB_PROFILS 4
 
 // Valeurs de départ : potentiomètres à mi-course, EQ plat, crunch léger
 static PedalParams params = {
@@ -86,7 +91,8 @@ static PedalParams params = {
   0.5f,    // high (plat)
   0.5f,    // tone
   0.5f,    // volume
-  1        // effet ON
+  1,       // effet ON
+  0        // profil : circuit SOAJ d'origine
 };
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -184,6 +190,17 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </div>
 
 <div class="card">
+  <div class="row"><label>Saturation &mdash; profil de p&eacute;dale</label></div>
+  <div class="grid" id="profsel">
+    <button data-n="0" class="sel">SOAJ<small>circuit d'origine</small></button>
+    <button data-n="1">TS9<small>overdrive doux</small></button>
+    <button data-n="2">RAT<small>disto mordante</small></button>
+    <button data-n="3">MUFF<small>fuzz compress&eacute;</small></button>
+  </div>
+  <div class="hint">profils convertis depuis des captures TONE3000 (pot Drive = gain du profil, Dist = intensit&eacute;)</div>
+</div>
+
+<div class="card">
   <div class="ctl"><div class="row"><label for="g">Drive</label><output id="og">0.50</output></div>
     <input type="range" id="g" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">gain d'entr&eacute;e (pot R5 de la formule) &mdash; pousse l'&eacute;tage de saturation</div></div>
@@ -228,7 +245,7 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 
 <script>
 var KEYS=['g','d','o','b','m','h','t','v'];
-var st={g:0.5,d:0.3,o:0,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
+var st={g:0.5,d:0.3,o:0,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1,p:0};
 var timer=null,lastEdit=0;
 function $(id){return document.getElementById(id)}
 function paint(){
@@ -242,6 +259,8 @@ function paint(){
   $('fsw').className=on?'on':'';
   $('fswtxt').textContent=(st.e==2)?'TEST DIRECT':(on?'EFFET ON':'BYPASS');
   $('direct').className=(st.e==2)?'sel':'';
+  var pb=document.querySelectorAll('#profsel button');
+  for(var i=0;i<pb.length;i++)pb[i].className=(+pb[i].getAttribute('data-n')==(st.p||0))?'sel':'';
 }
 function link(ok){
   $('dot').className='dot'+(ok?' on':'');
@@ -251,7 +270,7 @@ function push(){
   clearTimeout(timer);
   timer=setTimeout(function(){
     var q=KEYS.map(function(k){return k+'='+st[k]}).join('&');
-    fetch('/api/set?'+q+'&e='+st.e)
+    fetch('/api/set?'+q+'&e='+st.e+'&p='+(st.p||0))
       .then(function(r){link(r.ok)}).catch(function(){link(false)});
   },120);
 }
@@ -280,6 +299,11 @@ function relabel(mode){
 }
 document.querySelectorAll('#pedsel button').forEach(function(bt){
   bt.addEventListener('click',function(){relabel(this.getAttribute('data-m'));});
+});
+document.querySelectorAll('#profsel button').forEach(function(bt){
+  bt.addEventListener('click',function(){
+    st.p=+this.getAttribute('data-n');lastEdit=Date.now();paint();push();
+  });
 });
 var PRESETS={
   clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
@@ -334,9 +358,9 @@ static void sendParamsEspNow() {
 }
 
 static void logParams(const char *src) {
-  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f O=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
+  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f O=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d P=%d\n",
                 src, params.gain, params.dist, params.oct, params.low, params.mid,
-                params.high, params.tone, params.volume, params.effectOn);
+                params.high, params.tone, params.volume, params.effectOn, params.profil);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,14 +370,14 @@ static void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// GET /api/get -> {"g":0.50,"d":0.30,"o":0.00,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
+// GET /api/get -> {"g":0.50,"d":0.30,"o":0.00,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1,"p":0}
 static void handleApiGet() {
   char buf[160];
   snprintf(buf, sizeof(buf),
            "{\"g\":%.2f,\"d\":%.2f,\"o\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
-           "\"t\":%.2f,\"v\":%.2f,\"e\":%d}",
+           "\"t\":%.2f,\"v\":%.2f,\"e\":%d,\"p\":%d}",
            params.gain, params.dist, params.oct, params.low, params.mid,
-           params.high, params.tone, params.volume, params.effectOn);
+           params.high, params.tone, params.volume, params.effectOn, params.profil);
   server.send(200, "application/json", buf);
 }
 
@@ -370,6 +394,8 @@ static void handleApiSet() {
   if (server.hasArg("v")) { params.volume = clampf(server.arg("v").toFloat(), VOLUME_MIN, VOLUME_MAX); changed = true; }
   if (server.hasArg("e")) { int ev = server.arg("e").toInt();
                             params.effectOn = (uint8_t)((ev < 0) ? 0 : (ev > 2 ? 2 : ev));             changed = true; }
+  if (server.hasArg("p")) { int pv = server.arg("p").toInt();
+                            params.profil = (uint8_t)((pv < 0) ? 0 : (pv >= NB_PROFILS ? NB_PROFILS - 1 : pv)); changed = true; }
   if (changed) {
     paramsDirty = true;
     logParams("WEB");
@@ -418,6 +444,10 @@ static void parseCommand(const String &cmd) {
       case 'V': params.volume = clampf(v, VOLUME_MIN, VOLUME_MAX);   changed = true; break;
       case 'E': params.effectOn = (v >= 1.5f) ? 2 : ((v >= 0.5f) ? 1 : 0); changed = true; break;
                 // E:0 = bypass, E:1 = effet, E:2 = TEST DIRECT (diagnostic)
+      case 'P': { int pv = (int)v;
+                  params.profil = (uint8_t)((pv < 0) ? 0 : (pv >= NB_PROFILS ? NB_PROFILS - 1 : pv));
+                  changed = true; break; }
+                // P:0 = circuit SOAJ, P:1 = TS9, P:2 = RAT, P:3 = BIG MUFF
       default:  break;
     }
   }
@@ -484,7 +514,7 @@ void setup() {
   server.begin();
 
   Serial.println("[Web] Serveur démarré. Connectez le téléphone au WiFi puis ouvrez http://192.168.4.1");
-  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;O:1;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
+  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;O:1;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1;P:0");
 }
 
 // ---------------------------------------------------------------------------
