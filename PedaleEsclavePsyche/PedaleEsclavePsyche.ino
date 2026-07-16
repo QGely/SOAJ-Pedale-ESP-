@@ -148,6 +148,8 @@ static volatile float tgtBright = 0.5f;   // high
 static volatile float tgtTone   = 0.6f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
+// Mode TEST DIRECT (effectOn = 2) : ADC -> DAC, aucun traitement (diagnostic)
+static volatile bool  directMode = false;
 
 // ---------------------------------------------------------------------------
 // État du traitement
@@ -226,7 +228,8 @@ static void applyParams(const PedalParams *p) {
   tgtBright = clampf(p->high,   0.0f, 1.0f);
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, 1.0f);
-  tgtEffect = p->effectOn ? 1.0f : 0.0f;
+  tgtEffect = (p->effectOn == 1) ? 1.0f : 0.0f;
+  directMode = (p->effectOn == 2);
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -288,6 +291,13 @@ static inline void dacStep() {
 // Traitement d'UN échantillon
 // ---------------------------------------------------------------------------
 static inline void processSample() {
+  // --- MODE TEST DIRECT : ADC -> DAC, strictement rien d'autre ---
+  if (directMode) {
+    const int raw = readGuitarAdc();
+    dacWrite(PIN_AUDIO_OUT, (uint8_t)(raw >> 4));
+    return;
+  }
+
   // --- Lissage des paramètres ---
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
   smDist   += PARAM_SMOOTH * (tgtDist   - smDist);
@@ -479,8 +489,8 @@ void loop() {
     if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
     processSample();                       // calcule dacTarget + 1er pas
     lastStepUs = micros();
-  } else if ((uint32_t)(now - lastStepUs) >= SD_STEP_US) {
+  } else if (!directMode && (uint32_t)(now - lastStepUs) >= SD_STEP_US) {
     dacStep();                             // pas sigma-delta intermédiaire
-    lastStepUs = now;
+    lastStepUs = now;                      // (coupé en mode TEST DIRECT)
   }
 }

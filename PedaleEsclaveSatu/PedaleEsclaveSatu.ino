@@ -235,6 +235,10 @@ static volatile float tgtHigh   = 0.5f;
 static volatile float tgtTone   = 0.5f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
+// Mode TEST DIRECT (effectOn = 2) : ADC copié tel quel vers le DAC,
+// strictement AUCUN traitement — sert à diagnostiquer si un bruit vient
+// des convertisseurs/du câblage ou du traitement logiciel.
+static volatile bool  directMode = false;
 
 // ---------------------------------------------------------------------------
 // Biquad IIR : y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
@@ -493,7 +497,8 @@ static void applyParams(const PedalParams *p) {
   tgtHigh   = clampf(p->high,   0.0f, 1.0f);
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
-  tgtEffect = p->effectOn ? 1.0f : 0.0f;
+  tgtEffect = (p->effectOn == 1) ? 1.0f : 0.0f;
+  directMode = (p->effectOn == 2);
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -585,6 +590,15 @@ static inline void dacStep() {
 // Traitement d'UN échantillon
 // ---------------------------------------------------------------------------
 static inline void processSample() {
+  // --- MODE TEST DIRECT : ADC -> DAC, strictement rien d'autre ---
+  // Pas de gain, pas de filtre, pas de gate, pas de sigma-delta : la
+  // guitare telle que les convertisseurs la voient (12 bits -> 8 bits, 1:1).
+  if (directMode) {
+    const int raw = readGuitarAdc();
+    dacWrite(PIN_AUDIO_OUT, (uint8_t)(raw >> 4));
+    return;
+  }
+
   // Lissage des paramètres (progression douce, pas de craquement)
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
   smDist   += PARAM_SMOOTH * (tgtDist   - smDist);
@@ -844,8 +858,8 @@ void loop() {
     if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
     processSample();                       // calcule dacTarget + 1er pas
     lastStepUs = micros();
-  } else if ((uint32_t)(now - lastStepUs) >= SD_STEP_US) {
+  } else if (!directMode && (uint32_t)(now - lastStepUs) >= SD_STEP_US) {
     dacStep();                             // pas sigma-delta intermédiaire
-    lastStepUs = now;
+    lastStepUs = now;                      // (coupé en mode TEST DIRECT)
   }
 }

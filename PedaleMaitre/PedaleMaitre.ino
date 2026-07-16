@@ -219,6 +219,9 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 <div class="card fswrap">
   <button id="fsw" aria-label="effet"></button>
   <div id="fswtxt">BYPASS</div>
+  <div class="grid" style="grid-template-columns:1fr;width:100%;margin-top:14px">
+    <button id="direct">TEST DIRECT<small>ADC &rarr; DAC : rien que la guitare, aucun traitement</small></button>
+  </div>
 </div>
 <footer>http://192.168.4.1 &mdash; SOAJ P&eacute;dale ESP32</footer>
 </div>
@@ -237,7 +240,8 @@ function paint(){
   });
   var on=(st.e==1);
   $('fsw').className=on?'on':'';
-  $('fswtxt').textContent=on?'EFFET ON':'BYPASS';
+  $('fswtxt').textContent=(st.e==2)?'TEST DIRECT':(on?'EFFET ON':'BYPASS');
+  $('direct').className=(st.e==2)?'sel':'';
 }
 function link(ok){
   $('dot').className='dot'+(ok?' on':'');
@@ -298,6 +302,9 @@ document.querySelectorAll('#presets button').forEach(function(bt){
 });
 $('fsw').addEventListener('click',function(){
   st.e=st.e==1?0:1;lastEdit=Date.now();paint();push();
+});
+$('direct').addEventListener('click',function(){
+  st.e=st.e==2?1:2;lastEdit=Date.now();paint();push();
 });
 function poll(){
   fetch('/api/get').then(function(r){return r.json()}).then(function(j){
@@ -361,7 +368,8 @@ static void handleApiSet() {
   if (server.hasArg("h")) { params.high   = clampf(server.arg("h").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("t")) { params.tone   = clampf(server.arg("t").toFloat(), TONE_MIN, TONE_MAX);     changed = true; }
   if (server.hasArg("v")) { params.volume = clampf(server.arg("v").toFloat(), VOLUME_MIN, VOLUME_MAX); changed = true; }
-  if (server.hasArg("e")) { params.effectOn = (server.arg("e").toInt() >= 1) ? 1 : 0;                  changed = true; }
+  if (server.hasArg("e")) { int ev = server.arg("e").toInt();
+                            params.effectOn = (uint8_t)((ev < 0) ? 0 : (ev > 2 ? 2 : ev));             changed = true; }
   if (changed) {
     paramsDirty = true;
     logParams("WEB");
@@ -408,7 +416,8 @@ static void parseCommand(const String &cmd) {
       case 'H': params.high   = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'T': params.tone   = clampf(v, TONE_MIN, TONE_MAX);       changed = true; break;
       case 'V': params.volume = clampf(v, VOLUME_MIN, VOLUME_MAX);   changed = true; break;
-      case 'E': params.effectOn = (v >= 0.5f) ? 1 : 0;               changed = true; break;
+      case 'E': params.effectOn = (v >= 1.5f) ? 2 : ((v >= 0.5f) ? 1 : 0); changed = true; break;
+                // E:0 = bypass, E:1 = effet, E:2 = TEST DIRECT (diagnostic)
       default:  break;
     }
   }
