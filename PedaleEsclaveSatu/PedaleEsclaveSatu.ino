@@ -137,6 +137,16 @@
                                       // Low=0.5 ; le pot Low le fait glisser
                                       // de 280 Hz (Low=0, serré) à 70 Hz
                                       // (Low=1, fuzz gras type Psycho)
+#define PRE_LPF_HZ          4000.0f   // passe-bas ANTI-SOUFFLE avant la
+                                      // saturation : le drive amplifie x20-100
+                                      // le souffle des convertisseurs, la
+                                      // saturation le compresse vers le
+                                      // plafond -> nappe de bruit 6-8 kHz.
+                                      // On coupe AVANT le gain ; la disto
+                                      // recrée les harmoniques au-dessus.
+                                      // (rôle du condensateur C4 du circuit
+                                      // TL082 réel, neutralisé par la course
+                                      // log du pot drive)
 #define CAB_LPF_HZ          5500.0f   // simulation haut-parleur (post-EQ)
 #define CAB_Q               0.707f    // Butterworth
 
@@ -235,6 +245,10 @@ static volatile float tgtHigh   = 0.5f;
 static volatile float tgtTone   = 0.5f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
+// Mode TEST DIRECT (effectOn = 2) : ADC copié tel quel vers le DAC,
+// strictement AUCUN traitement — sert à diagnostiquer si un bruit vient
+// des convertisseurs/du câblage ou du traitement logiciel.
+static volatile bool  directMode = false;
 
 // ---------------------------------------------------------------------------
 // Biquad IIR : y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
@@ -407,15 +421,21 @@ static float dcOffset = 2048.0f;
 static Biquad fHin    = {0};
 static Biquad fAmpli  = {0};
 static Biquad fTight  = {0};   // passe-haut de resserrage pré-écrêtage (140 Hz)
+static Biquad fPreLp  = {0};   // passe-bas anti-souffle pré-saturation (4 kHz)
 static Biquad fLow    = {0};
 static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
 static Biquad fCab    = {0};   // passe-bas "haut-parleur" post-EQ (5,5 kHz)
 static Biquad fSortie = {0};
-static float  quantErr = 0.0f;       // mise en forme du bruit DAC
+static float  quantErr  = 0.0f;      // erreur du quantificateur sigma-delta
+static float  dacTarget = 128.0f;    // valeur DAC visée (float, tenue entre
+                                     // deux échantillons pour le sigma-delta)
 static float  envelope = 0.0f;       // suiveur d'enveloppe RAPIDE du gate
 static float  envSlow  = 0.0f;       // suiveur LENT (mémoire de la note ~170 ms)
 static float  gateGain = 0.0f;       // gain du gate (0..1)
+// Passe-haut 120 Hz pour la MESURE d'enveloppe uniquement : la ronflette
+// secteur (50/100/150 Hz) captée par le câblage ne tient plus le gate ouvert
+static float  envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 
 // Étage octave fOXX : passe-haut 1 pôle sur le signal redressé |u|
 // (émule la liaison 10 µF qui retire la composante continue 2/π)
@@ -488,7 +508,8 @@ static void applyParams(const PedalParams *p) {
   tgtHigh   = clampf(p->high,   0.0f, 1.0f);
   tgtTone   = clampf(p->tone,   0.0f, 1.0f);
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
-  tgtEffect = p->effectOn ? 1.0f : 0.0f;
+  tgtEffect = (p->effectOn == 1) ? 1.0f : 0.0f;
+  directMode = (p->effectOn == 2);
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -554,9 +575,58 @@ static void playTestTone(float freqHz, float durSec, float amp) {
 #endif
 
 // ---------------------------------------------------------------------------
+// Pas de SIGMA-DELTA du DAC : quantifie dacTarget en réinjectant l'erreur.
+// Appelé au moins 2x par période d'échantillon (~40 kHz et plus, voir loop) :
+// le bruit de quantification du DAC 8 bits est repoussé vers l'ultrasonique
+// (12-20 kHz, que ni l'ampli ni l'oreille ne reproduisent) au lieu de
+// s'empiler en bande audible 6-9 kHz — c'était le "scratch" continu.
+// Mesuré en simulation : -6,7 dB de bruit dans la bande 5-9 kHz.
+// ---------------------------------------------------------------------------
+// Générateur de DITHER triangulaire ±0,5 LSB (xorshift32, ~0,1 µs).
+// Sans dither, la boucle d'erreur entre en CYCLE LIMITE dès que la sortie
+// est quasi constante : elle émet un SIFFLEMENT PUR dont la fréquence dépend
+// du niveau (mesuré : raies à 4-9 kHz jusqu'à -14 dB LSB) — c'était le "son
+// persistant". Le dither casse le cycle : -8 à -15 dB sur la raie, l'énergie
+// devient un souffle diffus non tonal.
+static uint32_t ditherSeed = 0x1234ABCDu;
+static inline float ditherTpdf() {
+  ditherSeed ^= ditherSeed << 13;
+  ditherSeed ^= ditherSeed >> 17;
+  ditherSeed ^= ditherSeed << 5;
+  const int a = (int)(ditherSeed & 0xFFu);
+  const int b = (int)((ditherSeed >> 8) & 0xFFu);
+  return (float)(a - b) * (0.5f / 255.0f);
+}
+
+static inline void dacStep() {
+  const float dth     = ditherTpdf();
+  const float desired = dacTarget + quantErr + dth;
+  int v = (int)lroundf(desired);
+  if (v < 0)   v = 0;
+  if (v > 255) v = 255;
+  quantErr = (desired - dth) - (float)v;   // le dither reste hors de la boucle
+  if (quantErr >  1.0f) quantErr =  1.0f;
+  if (quantErr < -1.0f) quantErr = -1.0f;
+#if DEBUG_METER
+  const int outDev = (v > 128) ? (v - 128) : (128 - v);
+  if (outDev > mPeakOut) mPeakOut = outDev;
+#endif
+  dacWrite(PIN_AUDIO_OUT, (uint8_t)v);
+}
+
+// ---------------------------------------------------------------------------
 // Traitement d'UN échantillon
 // ---------------------------------------------------------------------------
 static inline void processSample() {
+  // --- MODE TEST DIRECT : ADC -> DAC, strictement rien d'autre ---
+  // Pas de gain, pas de filtre, pas de gate, pas de sigma-delta : la
+  // guitare telle que les convertisseurs la voient (12 bits -> 8 bits, 1:1).
+  if (directMode) {
+    const int raw = readGuitarAdc();
+    dacWrite(PIN_AUDIO_OUT, (uint8_t)(raw >> 4));
+    return;
+  }
+
   // Lissage des paramètres (progression douce, pas de craquement)
   smGain   += PARAM_SMOOTH * (tgtGain   - smGain);
   smDist   += PARAM_SMOOTH * (tgtDist   - smDist);
@@ -608,7 +678,13 @@ static inline void processSample() {
 #endif
 
   // --- Noise gate INTELLIGENT : enveloppes rapide + lente sur l'ENTRÉE ---
-  const float mag = fabsf(x);
+  // La mesure passe d'abord par un passe-haut 120 Hz : le ronflement secteur
+  // capté par les fils volants n'ouvre/ne retient plus le gate (le mi grave
+  // 82 Hz garde ses harmoniques bien au-dessus de 120 Hz : il ouvre normalement)
+  const float eh = envHpA * (envHpY + x - envHpX);
+  envHpX = x;
+  envHpY = eh;
+  const float mag = fabsf(eh);
   envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE)      * (mag - envelope);
   envSlow  += (mag > envSlow  ? ENV_ATTACK : ENV_RELEASE_SLOW) * (mag - envSlow);
 
@@ -650,6 +726,12 @@ static inline void processSample() {
   // --- 2a. Resserrage pré-écrêtage : passe-haut 140 Hz sur la voie saturée
   //     (le bas "bave" dans la disto ; l'EQ Low peut le remettre APRÈS) ---
   y = biquadRun(&fTight, y);
+
+  // --- 2a-bis. Anti-souffle : passe-bas 4 kHz AVANT la saturation ---
+  // Le souffle des convertisseurs amplifié par le drive puis compressé par
+  // le fuzz = la nappe de bruit continue 6-8 kHz. On le coupe ici ; la
+  // saturation recrée de toute façon les harmoniques au-dessus de 4 kHz.
+  y = biquadRun(&fPreLp, y);
 
   // --- 2b. Octave O(u,o) — redressement double alternance (fOXX) ---
   // |u| ne contient que les harmoniques PAIRS -> la fondamentale disparaît,
@@ -702,21 +784,9 @@ static inline void processSample() {
   const float dry = x * BYPASS_GAIN;
   y = dry + (y - dry) * smEffect;
 
-  // --- DAC 8 bits centré sur 128 + mise en forme du bruit ---
-  const float desired = 128.0f + y * OUTPUT_LEVEL * 127.0f + quantErr;
-  int dacVal = (int)lroundf(desired);
-  if (dacVal < 0)   dacVal = 0;
-  if (dacVal > 255) dacVal = 255;
-  quantErr = desired - (float)dacVal;
-  if (quantErr >  1.0f) quantErr =  1.0f;
-  if (quantErr < -1.0f) quantErr = -1.0f;
-
-#if DEBUG_METER
-  const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
-  if (outDev > mPeakOut) mPeakOut = outDev;
-#endif
-
-  dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
+  // --- Cible DAC : la sortie physique est tenue par le sigma-delta (~40 kHz) ---
+  dacTarget = 128.0f + y * OUTPUT_LEVEL * 127.0f;
+  dacStep();
 }
 
 // ---------------------------------------------------------------------------
@@ -750,10 +820,20 @@ void setup() {
   calcSortie(&fSortie, smTone, smVolume);
   // Resserrage pré-écrêtage (fréquence pilotée par le pot Low)
   calcTight(&fTight, smLow);
+  // Passe-haut 120 Hz de la mesure d'enveloppe du gate (anti-ronflette)
+  {
+    const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
+    envHpA = rc / (rc + DT_SEC);
+  }
   // Simulation haut-parleur : passe-bas Butterworth H(s) = 1/(1 + s/(Q·w0) + s²/w0²)
   {
     const float w0 = 2.0f * (float)M_PI * CAB_LPF_HZ;
     bilinear2(&fCab, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * w0), 1.0f / (w0 * w0));
+  }
+  // Anti-souffle pré-saturation : passe-bas Butterworth 4 kHz
+  {
+    const float w0 = 2.0f * (float)M_PI * PRE_LPF_HZ;
+    bilinear2(&fPreLp, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * w0), 1.0f / (w0 * w0));
   }
   calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));    eqLowCalc  = smLow;
   calcPeak(&fMid, EQ_MID_HZ, EQ_MID_Q, eqDb(smMid)); eqMidCalc = smMid;
@@ -803,14 +883,22 @@ void setup() {
 }
 
 // ---------------------------------------------------------------------------
-// Boucle audio : cadence fixe 20 kHz
+// Boucle audio : échantillons à 20 kHz + pas sigma-delta intermédiaires
+// (le DAC est re-quantifié toutes les >=25 µs, soit ~40 kHz effectifs)
 // ---------------------------------------------------------------------------
+#define SD_STEP_US 25
+static uint32_t lastStepUs = 0;
+
 void loop() {
   const uint32_t now = micros();
-  if ((int32_t)(now - nextSampleUs) < 0) return;
 
-  nextSampleUs += SAMPLE_PERIOD_US;
-  if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
-
-  processSample();
+  if ((int32_t)(now - nextSampleUs) >= 0) {
+    nextSampleUs += SAMPLE_PERIOD_US;
+    if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
+    processSample();                       // calcule dacTarget + 1er pas
+    lastStepUs = micros();
+  } else if (!directMode && (uint32_t)(now - lastStepUs) >= SD_STEP_US) {
+    dacStep();                             // pas sigma-delta intermédiaire
+    lastStepUs = now;                      // (coupé en mode TEST DIRECT)
+  }
 }
