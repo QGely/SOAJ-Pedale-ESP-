@@ -21,6 +21,13 @@
  *    x · CLEAN_GAIN · Volume, c'est tout. Le pot Dist fond continûment de ce
  *    chemin brut (0) vers la chaîne traitée complète (~0.25 et au-delà).
  *
+ *  + PROFILS DE PÉDALES (paramètre p, sélecteur sur la page web) : p = 0 est
+ *    le circuit ci-dessus ; p >= 1 REMPLACE les étages 2-3 par un profil
+ *    converti depuis une capture TONE3000/NAM (outils/profil_pedale.py) :
+ *    drive log -> passe-haut -> passe-bas -> COURBE D'ÉCRÊTAGE mesurée (LUT)
+ *    -> médiums post -> passe-bas de voicing. Gate, octave, EQ 3 bandes,
+ *    simulation HP, tone et volume restent actifs dans les deux modes.
+ *
  *  + NOISE GATE (indispensable en high-gain : sans lui, guitare à volume 0,
  *    le bruit ADC est normalisé vers ±1 par le fuzz -> souffle constant).
  *    Enveloppe mesurée sur l'entrée ; gain du gate appliqué AVANT l'étage de
@@ -61,6 +68,11 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <math.h>
+
+// Profils de pédales (TONE3000/NAM convertis par outils/profil_pedale.py) :
+// courbe d'écrêtage mesurée + filtres de voicing. Le profil 0 est le circuit
+// SOAJ d'origine ; les autres REMPLACENT l'étage de saturation ci-dessous.
+#include "profils_pedales.h"
 
 // Lecture ADC rapide (~10 µs) via le pilote bas niveau.
 #define USE_LEGACY_ADC
@@ -233,6 +245,7 @@ typedef struct __attribute__((packed)) {
   float    tone;      // t : tonalité (0..1)
   float    volume;    // v : volume (0..1)
   uint8_t  effectOn;  // 0 = bypass, 1 = effet actif
+  uint8_t  profil;    // p : 0 = circuit SOAJ, 1..NB_PROFILS-1 = profils TONE3000
 } PedalParams;
 
 // Cibles reçues par radio (défauts si le maître n'est pas encore là)
@@ -245,6 +258,7 @@ static volatile float tgtHigh   = 0.5f;
 static volatile float tgtTone   = 0.5f;
 static volatile float tgtVolume = 0.5f;
 static volatile float tgtEffect = 1.0f;
+static volatile uint8_t tgtProfil = 0;   // 0 = circuit SOAJ d'origine
 // Mode TEST DIRECT (effectOn = 2) : ADC copié tel quel vers le DAC,
 // strictement AUCUN traitement — sert à diagnostiquer si un bruit vient
 // des convertisseurs/du câblage ou du traitement logiciel.
@@ -415,6 +429,24 @@ static void calcTight(Biquad *f, float lowPos) {
 }
 
 // ---------------------------------------------------------------------------
+// Profils de pédales : lecture de la courbe et changement de profil
+// ---------------------------------------------------------------------------
+// Fondu anti-clic au changement de profil : la voie traitée descend à zéro
+// (~35 ms), le profil est échangé états remis à zéro, puis remonte.
+#define PROF_FADE_STEP  0.0015f
+
+// Lecture de la courbe d'écrêtage avec interpolation linéaire.
+// Hors de ±LUT_PLAGE la courbe est prolongée à plat (saturation écrasée).
+static inline float lireCourbe(const float *lut, float u) {
+  const float pos = (u + LUT_PLAGE) * ((float)(LUT_TAILLE - 1) / (2.0f * LUT_PLAGE));
+  if (pos <= 0.0f) return lut[0];
+  if (pos >= (float)(LUT_TAILLE - 1)) return lut[LUT_TAILLE - 1];
+  const int   i  = (int)pos;
+  const float fr = pos - (float)i;
+  return lut[i] + fr * (lut[i + 1] - lut[i]);
+}
+
+// ---------------------------------------------------------------------------
 // État du traitement audio
 // ---------------------------------------------------------------------------
 static float dcOffset = 2048.0f;
@@ -422,6 +454,10 @@ static Biquad fHin    = {0};
 static Biquad fAmpli  = {0};
 static Biquad fTight  = {0};   // passe-haut de resserrage pré-écrêtage (140 Hz)
 static Biquad fPreLp  = {0};   // passe-bas anti-souffle pré-saturation (4 kHz)
+static Biquad fProfHp = {0};   // profil : passe-haut avant écrêtage
+static Biquad fProfLp = {0};   // profil : passe-bas anti-souffle avant écrêtage
+static Biquad fProfMid= {0};   // profil : médiums post-écrêtage (bosse/creux)
+static Biquad fProfOut= {0};   // profil : passe-bas de sortie (voicing)
 static Biquad fLow    = {0};
 static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
@@ -462,12 +498,46 @@ static float satHard = 1.0f;   // gain vers l'écrêtage dur = 1 + SAT_HARD · d
 // Compensation du décalage en sortie : tanh(SAT_ASYM), constant
 static const float SAT_BIAS_OUT = 0.27290f;   // tanh(0.28)
 
+// Profil de pédale ACTIF (0 = circuit SOAJ) + fondu de changement + gain drive
+static uint8_t curProfil = 0;
+static float   profFade  = 1.0f;
+static float   profGain  = 1.0f;   // pot DRIVE dans la plage gainMin..gainMax
+
 // Dernières valeurs EQ pour lesquelles les biquads ont été calculés
 // (on ne refait le calcul trigonométrique que si le pot a vraiment bougé)
 static float eqLowCalc = -1.0f, eqMidCalc = -1.0f, eqHighCalc = -1.0f;
 
 static uint16_t coefCountdown = 0;
 static uint32_t nextSampleUs  = 0;
+
+// Remise à zéro de l'état d'un biquad (les coefficients restent)
+static void resetBiquad(Biquad *f) {
+  f->x1 = f->x2 = f->y1 = f->y2 = 0.0f;
+}
+
+// Prépare les filtres du profil idx (idx >= 1) et remet leurs états à zéro.
+// Pour idx == 0 (circuit d'origine), remet à zéro les étages propres au
+// circuit : leur état est périmé après un passage en mode profil.
+static void chargerProfil(uint8_t idx) {
+  if (idx == 0) {
+    resetBiquad(&fAmpli);
+    resetBiquad(&fTight);
+    resetBiquad(&fPreLp);
+    return;
+  }
+  const ProfilPedale *pp = &PROFILS[idx];
+  const float tauH = 1.0f / (2.0f * (float)M_PI * pp->preHpfHz);
+  bilinear1(&fProfHp, 0.0f, tauH, 1.0f, tauH);
+  const float wLp = 2.0f * (float)M_PI * pp->preLpfHz;
+  bilinear2(&fProfLp, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * wLp), 1.0f / (wLp * wLp));
+  calcPeak(&fProfMid, pp->postMidHz, pp->postMidQ, pp->postMidDb);
+  const float wOut = 2.0f * (float)M_PI * pp->postLpfHz;
+  bilinear2(&fProfOut, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * wOut), 1.0f / (wOut * wOut));
+  resetBiquad(&fProfHp);
+  resetBiquad(&fProfLp);
+  resetBiquad(&fProfMid);
+  resetBiquad(&fProfOut);
+}
 
 // ---------------------------------------------------------------------------
 // Utilitaires
@@ -510,6 +580,7 @@ static void applyParams(const PedalParams *p) {
   tgtVolume = clampf(p->volume, 0.0f, VOLUME_MAX);
   tgtEffect = (p->effectOn == 1) ? 1.0f : 0.0f;
   directMode = (p->effectOn == 2);
+  tgtProfil = (p->profil < NB_PROFILS) ? p->profil : 0;
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -545,11 +616,11 @@ static inline void meterTick(float raw) {
                     mPeakIn);
     } else {
       Serial.printf("[Metre] entree: %.0f pas ADC | env=%.4f gate=%s(%.2f) | "
-                    "sortie DAC: +/-%d pas | G=%.2f D=%.2f (Vsat=%.3f) O=%.2f "
-                    "B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
+                    "sortie DAC: +/-%d pas | profil=%s G=%.2f D=%.2f (Vsat=%.3f) "
+                    "O=%.2f B/M/H=%.2f/%.2f/%.2f T=%.2f V=%.2f E=%.0f\n",
                     mPeakIn, envelope, (gateGain > 0.5f) ? "OUVERT" : "ferme",
-                    gateGain, mPeakOut, smGain, smDist, satVsat, smOct,
-                    smLow, smMid, smHigh, smTone, smVolume, smEffect);
+                    gateGain, mPeakOut, PROFILS[curProfil].nom, smGain, smDist,
+                    satVsat, smOct, smLow, smMid, smHigh, smTone, smVolume, smEffect);
     }
     mPeakIn  = 0.0f;
     mPeakOut = 0;
@@ -652,6 +723,12 @@ static inline void processSample() {
     satBias = SAT_ASYM * satVsat;
     satHard = 1.0f + SAT_HARD * smDist;
 
+    // Profil actif : le pot DRIVE parcourt gainMin..gainMax en course log
+    if (curProfil > 0) {
+      const ProfilPedale *pc = &PROFILS[curProfil];
+      profGain = pc->gainMin * powf(pc->gainMax / pc->gainMin, smGain);
+    }
+
     if (fabsf(smLow - eqLowCalc) > 0.002f) {
       calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));
       calcTight(&fTight, smLow);       // le pot Low pilote aussi le resserrage
@@ -719,19 +796,47 @@ static inline void processSample() {
     quantErr = 0.0f;
   }
 
-  // --- 1-2. Étages linéaires d'entrée (gate appliqué AVANT le gain) ---
-  float y = biquadRun(&fHin,   x) * gateGain;   // Hin(s)
-  y       = biquadRun(&fAmpli, y);              // Hampli(s,g)
+  // --- Changement de profil : fondu descendant, échange, fondu montant ---
+  // (profFade multiplie la voie traitée plus bas : aucun clic à l'échange)
+  if (tgtProfil != curProfil) {
+    profFade -= PROF_FADE_STEP;
+    if (profFade <= 0.0f) {
+      profFade  = 0.0f;
+      curProfil = tgtProfil;
+      chargerProfil(curProfil);
+      if (curProfil > 0) {
+        const ProfilPedale *pc = &PROFILS[curProfil];
+        profGain = pc->gainMin * powf(pc->gainMax / pc->gainMin, smGain);
+      }
+    }
+  } else if (profFade < 1.0f) {
+    profFade += PROF_FADE_STEP;
+    if (profFade > 1.0f) profFade = 1.0f;
+  }
+  const ProfilPedale *prof = (curProfil > 0) ? &PROFILS[curProfil] : NULL;
 
-  // --- 2a. Resserrage pré-écrêtage : passe-haut 140 Hz sur la voie saturée
-  //     (le bas "bave" dans la disto ; l'EQ Low peut le remettre APRÈS) ---
-  y = biquadRun(&fTight, y);
+  // --- 1. Liaison d'entrée (gate appliqué AVANT le gain) ---
+  float y = biquadRun(&fHin, x) * gateGain;     // Hin(s)
 
-  // --- 2a-bis. Anti-souffle : passe-bas 4 kHz AVANT la saturation ---
-  // Le souffle des convertisseurs amplifié par le drive puis compressé par
-  // le fuzz = la nappe de bruit continue 6-8 kHz. On le coupe ici ; la
-  // saturation recrée de toute façon les harmoniques au-dessus de 4 kHz.
-  y = biquadRun(&fPreLp, y);
+  if (prof) {
+    // --- 2'. Profil de pédale : drive log + filtres d'entrée du profil ---
+    y *= profGain;                              // pot DRIVE (gainMin..gainMax)
+    y = biquadRun(&fProfHp, y);                 // resserrage du grave
+    y = biquadRun(&fProfLp, y);                 // anti-souffle pré-écrêtage
+  } else {
+    // --- 2. Étages linéaires du circuit d'origine ---
+    y = biquadRun(&fAmpli, y);                  // Hampli(s,g)
+
+    // --- 2a. Resserrage pré-écrêtage : passe-haut 140 Hz sur la voie saturée
+    //     (le bas "bave" dans la disto ; l'EQ Low peut le remettre APRÈS) ---
+    y = biquadRun(&fTight, y);
+
+    // --- 2a-bis. Anti-souffle : passe-bas 4 kHz AVANT la saturation ---
+    // Le souffle des convertisseurs amplifié par le drive puis compressé par
+    // le fuzz = la nappe de bruit continue 6-8 kHz. On le coupe ici ; la
+    // saturation recrée de toute façon les harmoniques au-dessus de 4 kHz.
+    y = biquadRun(&fPreLp, y);
+  }
 
   // --- 2b. Octave O(u,o) — redressement double alternance (fOXX) ---
   // |u| ne contient que les harmoniques PAIRS -> la fondamentale disparaît,
@@ -744,15 +849,29 @@ static inline void processSample() {
     y += smOct * (OCT_GAIN * rectAc - y);       // fondu direct <-> octave
   }
 
-  // --- 3. Saturation S(u,d) : double tanh en cascade (agressif SANS fizz) ---
+  // --- 3. Écrêtage : courbe du profil OU saturation S(u,d) du circuit ---
+  // Dans les deux cas le pot Dist (satMix) fait le fondu clean <-> saturé.
   if (satMix > 0.0f) {
-    // Étage 1 : écrêtage doux ASYMÉTRIQUE (harmoniques paires, "lampe")
-    const float soft = tanhf((y + satBias) / satVsat) - SAT_BIAS_OUT;
-    // Étage 2 : re-amplifié puis tanh — aussi dense qu'un clip dur, mais sans
-    // angle net donc quasi pas d'aliasing (l'ancien clip dur créait des
-    // fréquences inharmoniques dissonantes sur les notes seules)
-    const float hard = tanhf(soft * satHard);
-    y += (hard - y) * satMix;               // fondu linéaire <-> saturé
+    if (prof) {
+      // Courbe d'écrêtage mesurée (LUT interpolée) + rattrapage de niveau
+      const float w = lireCourbe(prof->courbe, y) * prof->sortieGain;
+      y += (w - y) * satMix;
+    } else {
+      // Étage 1 : écrêtage doux ASYMÉTRIQUE (harmoniques paires, "lampe")
+      const float soft = tanhf((y + satBias) / satVsat) - SAT_BIAS_OUT;
+      // Étage 2 : re-amplifié puis tanh — aussi dense qu'un clip dur, mais sans
+      // angle net donc quasi pas d'aliasing (l'ancien clip dur créait des
+      // fréquences inharmoniques dissonantes sur les notes seules)
+      const float hard = tanhf(soft * satHard);
+      y += (hard - y) * satMix;             // fondu linéaire <-> saturé
+    }
+  }
+
+  // --- 3b. Voicing de sortie du profil : médiums (bosse TS9 / creux Muff)
+  //     puis passe-bas — l'équivalent du circuit de tone propre à la pédale ---
+  if (prof) {
+    y = biquadRun(&fProfMid, y);
+    y = biquadRun(&fProfOut, y);
   }
 
   // --- 4-5. Égaliseur 3 bandes ---
@@ -772,6 +891,9 @@ static inline void processSample() {
   //     d'entrée, sans cette 2e application on entendrait le bruit
   //     "redescendre" à chaque fin de note (atténuation au carré) ---
   y *= gateGain;
+
+  // --- Fondu de changement de profil (anti-clic, voir plus haut) ---
+  y *= profFade;
 
   // --- CLEAN pur : à Dist = 0 le signal ne subit AUCUNE modification,
   //     seulement le rehaussement CLEAN_GAIN dosé par le pot Volume.

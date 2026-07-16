@@ -180,6 +180,53 @@ jouant = seuils de gate trop hauts ; `sortie DAC: +/-0` = volume à zéro ou eff
 
 ---
 
+## Profils de pédales (captures TONE3000 → ESP32)
+
+La pédale SATU embarque des **profils de saturation** sélectionnables depuis le
+téléphone : le profil 0 est le circuit SOAJ d'origine, les suivants remplacent
+l'étage de saturation par l'approximation d'une pédale réelle :
+
+| `p` | Profil | Caractère |
+|---|---|---|
+| 0 | **SOAJ** (défaut) | le circuit d'origine décrit ci-dessus |
+| 1 | TS9 | Ibanez Tube Screamer — overdrive doux, médiums bossus |
+| 2 | RAT | ProCo RAT — distorsion mordante, écrêtage dur |
+| 3 | MUFF | Big Muff Pi — fuzz compressé, médiums creusés |
+
+- Sélection : boutons « Saturation — profil de pédale » sur la page web,
+  `p=` dans l'API HTTP, ou `P:1` au port série du maître.
+- Dans un profil : **Drive** parcourt la plage de gain de la pédale émulée,
+  **Dist** dose l'intensité (0 = clean pur, comme d'habitude). Gate, octave,
+  EQ 3 bandes, tone et volume restent actifs.
+- Le changement de profil se fait **en fondu (~35 ms)** : aucun clic.
+
+### Convertir votre propre capture tone3000.com
+
+Un modèle NAM complet (réseau de neurones 48 kHz) ne peut pas tourner en temps
+réel sur un ESP32 : le script `outils/profil_pedale.py` en extrait une
+**approximation légère** (courbe d'écrêtage mesurée en 257 points + filtres de
+voicing) exécutable à 20 kHz. En 3 étapes sur PC :
+
+```
+python3 outils/profil_pedale.py --test-wav test_sec.wav
+# passer test_sec.wav dans le plugin NAM (gratuit) avec la capture .nam
+# téléchargée depuis tone3000.com, exporter test_traite.wav SANS normaliser
+python3 outils/profil_pedale.py --analyser test_sec.wav test_traite.wav --nom MAPEDALE
+```
+
+Le bloc C imprimé se colle dans `PedaleEsclaveSatu/profils_pedales.h`
+(incrémenter `NB_PROFILS`, ajouter l'entrée dans `PROFILS[]`, ajouter un
+bouton dans la page du maître), puis re-téléverser esclave et maître.
+L'approximation garde le caractère statique de la capture (courbe d'écrêtage,
+voicing) mais pas son comportement dynamique fin — la capture NAM d'origine
+reste la référence.
+
+> Rappel : le téléphone connecté à `SOAJ-Pedale` n'a pas Internet — la
+> conversion se fait à l'avance sur PC, les profils sont compilés dans
+> l'esclave. Rien d'autre que les paramètres ne transite par radio.
+
+---
+
 ## Contrôle depuis le téléphone (WiFi + page web)
 
 ### Connexion — 3 étapes, aucune appli à installer
