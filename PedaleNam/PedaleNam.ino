@@ -46,6 +46,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <math.h>
 
@@ -619,7 +620,8 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
   <button id="fsw" aria-label="effet"></button>
   <div id="fswtxt">BYPASS</div>
 </div>
-<footer>http://192.168.4.1 &mdash; SOAJ NAM ESP32</footer>
+<footer>http://192.168.4.1 &middot; http://soaj-nam.local &mdash; SOAJ NAM ESP32<br>
+page inaccessible ? couper les donn&eacute;es mobiles et rester sur ce WiFi</footer>
 </div>
 
 <script>
@@ -1000,9 +1002,30 @@ static void handleApiProfil() {
   server.send(200, "application/json", buf);
 }
 
+// Toute URL inconnue redirige vers la page (portail captif). "no-store" :
+// certains téléphones mettent en cache la réponse de leur sonde de
+// connectivité et ne re-testent plus — on l'interdit.
 static void handleNotFound() {
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  server.sendHeader("Cache-Control", "no-store");
   server.send(302, "text/plain", "");
+}
+
+// Sondes de détection de portail captif : à la connexion, chaque OS teste
+// une URL précise pour savoir s'il y a Internet. On répond NOUS-MÊMES une
+// redirection vers la page : le téléphone ouvre alors sa fenêtre
+// « connexion au réseau » — AUCUN accès Internet n'est nécessaire.
+// (onNotFound les couvrirait déjà ; les déclarer rend l'intention explicite
+// et garantit le comportement.)
+static void routesPortailCaptif() {
+  const char *sondes[] = {
+    "/generate_204", "/gen_204",                      // Android
+    "/hotspot-detect.html", "/library/test/success.html",  // iOS / macOS
+    "/connecttest.txt", "/ncsi.txt", "/redirect",     // Windows
+    "/canonical.html", "/success.txt",                // Firefox
+  };
+  for (size_t i = 0; i < sizeof(sondes) / sizeof(sondes[0]); i++)
+    server.on(sondes[i], handleNotFound);
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,13 +1104,29 @@ void setup() {
   Serial.printf("[WiFi] Point d'accès \"%s\" (mdp \"%s\") — http://", AP_SSID, AP_PASSWORD);
   Serial.println(WiFi.softAPIP());
 
+  // DNS captif : TOUTE résolution renvoie l'IP de la pédale, y compris les
+  // requêtes malformées (NoError + TTL court : certains téléphones gardent
+  // sinon un échec en cache et concluent « pas d'Internet, pas de portail »)
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.setTTL(30);
   dnsServer.start(53, "*", WiFi.softAPIP());
+
+  // mDNS : accès de secours SANS DNS captif ni Internet — http://soaj-nam.local
+  // (utile si le téléphone route les IP inconnues vers la 4G/5G)
+  if (MDNS.begin("soaj-nam")) MDNS.addService("http", "tcp", 80);
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/get", HTTP_GET, handleApiGet);
   server.on("/api/set", HTTP_GET, handleApiSet);
   server.on("/api/profil", HTTP_POST, handleApiProfil);
+  routesPortailCaptif();                 // sondes Android/iOS/Windows/Firefox
   server.onNotFound(handleNotFound);
   server.begin();
+
+  Serial.println("[Web] Si la page ne s'ouvre pas toute seule :");
+  Serial.println("      1. COUPER les données mobiles (4G/5G) le temps du réglage");
+  Serial.println("      2. Rester connecté au WiFi même si « pas d'Internet »");
+  Serial.println("      3. Taper http://192.168.4.1 (avec http:// !) ou http://soaj-nam.local");
 
   // --- Stabilisation de l'offset DC avant de sortir du son ---
   for (int i = 0; i < 4000; i++) {
