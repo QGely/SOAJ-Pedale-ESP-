@@ -78,6 +78,9 @@
 #define DIST_ASYM           0.22f
 #define DIST_MIX_RAMP       4.0f      // fondu clean->disto sur le 1er quart
 static const float DIST_BIAS_OUT = 0.21651f;   // tanh(0.22)
+// Passe-bas anti-souffle AVANT la distorsion : le souffle des convertisseurs
+// amplifié par le drive puis compressé par la disto = nappe de bruit 6-8 kHz
+#define PRE_LPF_HZ          4000.0f
 
 // --- Réverbération (Schroeder/Freeverb réduit, tailles à 20 kHz) ------------
 #define COMB1_LEN           506       // 25,3 ms
@@ -160,6 +163,8 @@ static float gateGain  = 0.0f;
 // Passe-haut 120 Hz pour la mesure d'enveloppe (anti-ronflette secteur)
 static float envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 static float lpTone    = 0.0f;      // passe-bas de tone (1 pôle)
+static float lpPre     = 0.0f;      // passe-bas anti-souffle pré-disto (1 pôle)
+static float lpPreAlpha = 0.5f;     // coefficient (calculé au setup)
 static float quantErr  = 0.0f;      // erreur du quantificateur sigma-delta
 static float dacTarget = 128.0f;    // valeur DAC visée (tenue entre échantillons)
 
@@ -272,12 +277,25 @@ static inline void meterTick(float raw) {
 // bruit de quantification 8 bits vers l'ultrasonique au lieu de la bande
 // audible 6-9 kHz. Mesuré : -6,7 dB de bruit dans la bande 5-9 kHz.
 // ---------------------------------------------------------------------------
+// Dither triangulaire ±0,5 LSB : casse les cycles limites du quantificateur
+// (sifflements purs 4-9 kHz quand la sortie est quasi constante)
+static uint32_t ditherSeed = 0x5678EF01u;
+static inline float ditherTpdf() {
+  ditherSeed ^= ditherSeed << 13;
+  ditherSeed ^= ditherSeed >> 17;
+  ditherSeed ^= ditherSeed << 5;
+  const int a = (int)(ditherSeed & 0xFFu);
+  const int b = (int)((ditherSeed >> 8) & 0xFFu);
+  return (float)(a - b) * (0.5f / 255.0f);
+}
+
 static inline void dacStep() {
-  const float desired = dacTarget + quantErr;
+  const float dth     = ditherTpdf();
+  const float desired = dacTarget + quantErr + dth;
   int v = (int)lroundf(desired);
   if (v < 0)   v = 0;
   if (v > 255) v = 255;
-  quantErr = desired - (float)v;
+  quantErr = (desired - dth) - (float)v;   // le dither reste hors de la boucle
   if (quantErr >  1.0f) quantErr =  1.0f;
   if (quantErr < -1.0f) quantErr = -1.0f;
 #if DEBUG_METER
@@ -359,8 +377,11 @@ static inline void processSample() {
 
   const float xg = x * gateGain;
 
+  // --- Anti-souffle : passe-bas 4 kHz avant le gain/la distorsion ---
+  lpPre += lpPreAlpha * (xg - lpPre);
+
   // --- Distorsion S(u,d) : 0 = signal inchangé -> 1 = prononcée ---
-  const float pre = xg * driveGain;
+  const float pre = lpPre * driveGain;
   float y = pre;
   if (distMix > 0.0f) {
     const float sat = tanhf((pre + distBias) / distVsat) - DIST_BIAS_OUT;
@@ -436,6 +457,11 @@ void setup() {
   {
     const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
     envHpA = rc / (rc + DT_SEC);
+  }
+  // Passe-bas anti-souffle 4 kHz pré-distorsion
+  {
+    const float rc = 1.0f / (2.0f * (float)M_PI * PRE_LPF_HZ);
+    lpPreAlpha = DT_SEC / (rc + DT_SEC);
   }
 
   // Buffers de réverbe à zéro (silence initial)

@@ -137,6 +137,16 @@
                                       // Low=0.5 ; le pot Low le fait glisser
                                       // de 280 Hz (Low=0, serré) à 70 Hz
                                       // (Low=1, fuzz gras type Psycho)
+#define PRE_LPF_HZ          4000.0f   // passe-bas ANTI-SOUFFLE avant la
+                                      // saturation : le drive amplifie x20-100
+                                      // le souffle des convertisseurs, la
+                                      // saturation le compresse vers le
+                                      // plafond -> nappe de bruit 6-8 kHz.
+                                      // On coupe AVANT le gain ; la disto
+                                      // recrée les harmoniques au-dessus.
+                                      // (rôle du condensateur C4 du circuit
+                                      // TL082 réel, neutralisé par la course
+                                      // log du pot drive)
 #define CAB_LPF_HZ          5500.0f   // simulation haut-parleur (post-EQ)
 #define CAB_Q               0.707f    // Butterworth
 
@@ -411,6 +421,7 @@ static float dcOffset = 2048.0f;
 static Biquad fHin    = {0};
 static Biquad fAmpli  = {0};
 static Biquad fTight  = {0};   // passe-haut de resserrage pré-écrêtage (140 Hz)
+static Biquad fPreLp  = {0};   // passe-bas anti-souffle pré-saturation (4 kHz)
 static Biquad fLow    = {0};
 static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
@@ -571,12 +582,29 @@ static void playTestTone(float freqHz, float durSec, float amp) {
 // s'empiler en bande audible 6-9 kHz — c'était le "scratch" continu.
 // Mesuré en simulation : -6,7 dB de bruit dans la bande 5-9 kHz.
 // ---------------------------------------------------------------------------
+// Générateur de DITHER triangulaire ±0,5 LSB (xorshift32, ~0,1 µs).
+// Sans dither, la boucle d'erreur entre en CYCLE LIMITE dès que la sortie
+// est quasi constante : elle émet un SIFFLEMENT PUR dont la fréquence dépend
+// du niveau (mesuré : raies à 4-9 kHz jusqu'à -14 dB LSB) — c'était le "son
+// persistant". Le dither casse le cycle : -8 à -15 dB sur la raie, l'énergie
+// devient un souffle diffus non tonal.
+static uint32_t ditherSeed = 0x1234ABCDu;
+static inline float ditherTpdf() {
+  ditherSeed ^= ditherSeed << 13;
+  ditherSeed ^= ditherSeed >> 17;
+  ditherSeed ^= ditherSeed << 5;
+  const int a = (int)(ditherSeed & 0xFFu);
+  const int b = (int)((ditherSeed >> 8) & 0xFFu);
+  return (float)(a - b) * (0.5f / 255.0f);
+}
+
 static inline void dacStep() {
-  const float desired = dacTarget + quantErr;
+  const float dth     = ditherTpdf();
+  const float desired = dacTarget + quantErr + dth;
   int v = (int)lroundf(desired);
   if (v < 0)   v = 0;
   if (v > 255) v = 255;
-  quantErr = desired - (float)v;
+  quantErr = (desired - dth) - (float)v;   // le dither reste hors de la boucle
   if (quantErr >  1.0f) quantErr =  1.0f;
   if (quantErr < -1.0f) quantErr = -1.0f;
 #if DEBUG_METER
@@ -699,6 +727,12 @@ static inline void processSample() {
   //     (le bas "bave" dans la disto ; l'EQ Low peut le remettre APRÈS) ---
   y = biquadRun(&fTight, y);
 
+  // --- 2a-bis. Anti-souffle : passe-bas 4 kHz AVANT la saturation ---
+  // Le souffle des convertisseurs amplifié par le drive puis compressé par
+  // le fuzz = la nappe de bruit continue 6-8 kHz. On le coupe ici ; la
+  // saturation recrée de toute façon les harmoniques au-dessus de 4 kHz.
+  y = biquadRun(&fPreLp, y);
+
   // --- 2b. Octave O(u,o) — redressement double alternance (fOXX) ---
   // |u| ne contient que les harmoniques PAIRS -> la fondamentale disparaît,
   // remplacée par l'octave supérieure. Le passe-haut émule la liaison 10 µF.
@@ -795,6 +829,11 @@ void setup() {
   {
     const float w0 = 2.0f * (float)M_PI * CAB_LPF_HZ;
     bilinear2(&fCab, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * w0), 1.0f / (w0 * w0));
+  }
+  // Anti-souffle pré-saturation : passe-bas Butterworth 4 kHz
+  {
+    const float w0 = 2.0f * (float)M_PI * PRE_LPF_HZ;
+    bilinear2(&fPreLp, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f / (CAB_Q * w0), 1.0f / (w0 * w0));
   }
   calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));    eqLowCalc  = smLow;
   calcPeak(&fMid, EQ_MID_HZ, EQ_MID_Q, eqDb(smMid)); eqMidCalc = smMid;
