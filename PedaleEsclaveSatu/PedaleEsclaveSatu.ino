@@ -433,8 +433,11 @@ static float  dacTarget = 128.0f;    // valeur DAC visée (float, tenue entre
 static float  envelope = 0.0f;       // suiveur d'enveloppe RAPIDE du gate
 static float  envSlow  = 0.0f;       // suiveur LENT (mémoire de la note ~170 ms)
 static float  gateGain = 0.0f;       // gain du gate (0..1)
-// Passe-haut 120 Hz pour la MESURE d'enveloppe uniquement : la ronflette
-// secteur (50/100/150 Hz) captée par le câblage ne tient plus le gate ouvert
+// Passe-haut 300 Hz pour la MESURE d'enveloppe uniquement : rejette à la fois
+// la ronflette secteur (50/100/150 Hz) ET le grondement de frottement de la
+// main posée sur les cordes (mesuré : énergie concentrée 100-300 Hz). Une
+// vraie note ouvre par ses harmoniques (mi grave 82 Hz : 328/410/492 Hz...)
+#define GATE_DETECT_HPF_HZ  300.0f
 static float  envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 
 // Étage octave fOXX : passe-haut 1 pôle sur le signal redressé |u|
@@ -678,9 +681,10 @@ static inline void processSample() {
 #endif
 
   // --- Noise gate INTELLIGENT : enveloppes rapide + lente sur l'ENTRÉE ---
-  // La mesure passe d'abord par un passe-haut 120 Hz : le ronflement secteur
-  // capté par les fils volants n'ouvre/ne retient plus le gate (le mi grave
-  // 82 Hz garde ses harmoniques bien au-dessus de 120 Hz : il ouvre normalement)
+  // La mesure passe d'abord par un passe-haut 300 Hz : ni le ronflement
+  // secteur ni le GRONDEMENT DE FROTTEMENT de la main posée sur les cordes
+  // (énergie 100-300 Hz) n'ouvrent le gate ; une vraie note ouvre par ses
+  // harmoniques, toujours présentes au-dessus de 300 Hz.
   const float eh = envHpA * (envHpY + x - envHpX);
   envHpX = x;
   envHpY = eh;
@@ -691,9 +695,14 @@ static inline void processSample() {
   // Cordes étouffées (chute brutale) ou note tenue (décroissance naturelle) ?
   const bool abrupt = (envelope < ABRUPT_RATIO * envSlow);
 
-  const float gateScale = (1.0f + GATE_DRIVE_SCALE * smGain
-                                + GATE_DIST_SCALE  * smDist)
-                          * (abrupt ? 1.0f : SUSTAIN_THRESH);
+  const float baseScale = 1.0f + GATE_DRIVE_SCALE * smGain
+                               + GATE_DIST_SCALE  * smDist;
+  // Les seuils "sustain" (x0.6) ne s'appliquent que si une VRAIE note a
+  // précédé (mémoire lente au-dessus du seuil haut) : le frottement de la
+  // main, qui varie lentement lui aussi, ne peut plus en profiter.
+  const bool  wasNote   = (envSlow > GATE_HIGH * baseScale);
+  const float gateScale = baseScale
+                          * ((!abrupt && wasNote) ? SUSTAIN_THRESH : 1.0f);
   const float gLow  = GATE_LOW  * gateScale;
   const float gHigh = GATE_HIGH * gateScale;
 
@@ -820,9 +829,9 @@ void setup() {
   calcSortie(&fSortie, smTone, smVolume);
   // Resserrage pré-écrêtage (fréquence pilotée par le pot Low)
   calcTight(&fTight, smLow);
-  // Passe-haut 120 Hz de la mesure d'enveloppe du gate (anti-ronflette)
+  // Passe-haut de la mesure d'enveloppe du gate (anti-ronflette + anti-frottement)
   {
-    const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
+    const float rc = 1.0f / (2.0f * (float)M_PI * GATE_DETECT_HPF_HZ);
     envHpA = rc / (rc + DT_SEC);
   }
   // Simulation haut-parleur : passe-bas Butterworth H(s) = 1/(1 + s/(Q·w0) + s²/w0²)

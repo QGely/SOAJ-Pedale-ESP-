@@ -160,7 +160,9 @@ static volatile bool  directMode = false;
 static float dcOffset  = 2048.0f;
 static float envelope  = 0.0f;
 static float gateGain  = 0.0f;
-// Passe-haut 120 Hz pour la mesure d'enveloppe (anti-ronflette secteur)
+// Passe-haut 300 Hz pour la mesure d'enveloppe : rejette la ronflette secteur
+// ET le grondement de frottement de la main posée sur les cordes (100-300 Hz)
+#define GATE_DETECT_HPF_HZ  300.0f
 static float envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 static float lpTone    = 0.0f;      // passe-bas de tone (1 pôle)
 static float lpPre     = 0.0f;      // passe-bas anti-souffle pré-disto (1 pôle)
@@ -453,9 +455,9 @@ void setup() {
 
   dacWrite(PIN_AUDIO_OUT, 128);
 
-  // Passe-haut 120 Hz de la mesure d'enveloppe du gate (anti-ronflette)
+  // Passe-haut de la mesure d'enveloppe du gate (anti-ronflette + anti-frottement)
   {
-    const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
+    const float rc = 1.0f / (2.0f * (float)M_PI * GATE_DETECT_HPF_HZ);
     envHpA = rc / (rc + DT_SEC);
   }
   // Passe-bas anti-souffle 4 kHz pré-distorsion
