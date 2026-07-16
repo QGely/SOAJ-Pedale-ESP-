@@ -133,7 +133,10 @@
 #define SAT_ASYM            0.28f     // décalage d'asymétrie (fractions de Vsat)
 #define SAT_HARD            2.2f      // poussée du 2e étage tanh à d max
 #define SAT_MIX_RAMP        4.0f      // fondu linéaire->saturé (continuité à d=0)
-#define TIGHT_HPF_HZ        140.0f    // resserrage pré-écrêtage
+#define TIGHT_HPF_HZ        140.0f    // resserrage pré-écrêtage — RÉFÉRENCE à
+                                      // Low=0.5 ; le pot Low le fait glisser
+                                      // de 280 Hz (Low=0, serré) à 70 Hz
+                                      // (Low=1, fuzz gras type Psycho)
 #define CAB_LPF_HZ          5500.0f   // simulation haut-parleur (post-EQ)
 #define CAB_Q               0.707f    // Butterworth
 
@@ -170,6 +173,18 @@
                                       // audible, la note s'arrête c'est tout
 #define GATE_SNAP           0.005f    // en dessous : gain collé à 0 strict
                                       // (sortie DAC exactement au repos)
+
+// --- Gate INTELLIGENT : sustain qui chante (solo) vs arrêt net (rythmique) --
+// Deux enveloppes : la rapide (ci-dessus) et une LENTE (~170 ms de mémoire).
+// Cordes ÉTOUFFÉES : la rapide s'effondre sous 35 % de la lente en ~30 ms
+//   -> fermeture franche (comportement rythmique inchangé).
+// Note TENUE qui décroît naturellement : les deux descendent ensemble
+//   -> seuils abaissés (x0.6) et fermeture douce : la note chante jusqu'au
+//   bout, comme le sustain du solo de Psycho.
+#define ENV_RELEASE_SLOW    0.0003f   // enveloppe lente (~170 ms)
+#define ABRUPT_RATIO        0.35f     // rapide < 35 % de la lente = étouffé
+#define SUSTAIN_THRESH      0.6f      // seuils x0.6 pendant un sustain naturel
+#define GATE_CLOSE_SOFT     0.0008f   // fermeture douce ~60 ms en fin de sustain
 
 // Lissage des paramètres (~60 ms) : aucun craquement au changement
 #define PARAM_SMOOTH        0.0008f
@@ -375,6 +390,16 @@ static inline float eqDb(float p) {
   return (p - 0.5f) * 2.0f * EQ_RANGE_DB;
 }
 
+// Resserrage pré-écrêtage LIÉ AU POT LOW : le pot façonne le grave AVANT et
+// APRÈS la disto. Low = 0.5 -> 140 Hz (référence), Low = 1 -> 70 Hz (fuzz
+// GRAS pleine bande, le son Psycho/Bellamy), Low = 0 -> 280 Hz (très serré,
+// metal chirurgical). fc = 140 · 2^((0.5−low)·2)
+static void calcTight(Biquad *f, float lowPos) {
+  const float fc  = TIGHT_HPF_HZ * powf(2.0f, (0.5f - lowPos) * 2.0f);
+  const float tau = 1.0f / (2.0f * (float)M_PI * fc);
+  bilinear1(f, 0.0f, tau, 1.0f, tau);
+}
+
 // ---------------------------------------------------------------------------
 // État du traitement audio
 // ---------------------------------------------------------------------------
@@ -388,7 +413,8 @@ static Biquad fHigh   = {0};
 static Biquad fCab    = {0};   // passe-bas "haut-parleur" post-EQ (5,5 kHz)
 static Biquad fSortie = {0};
 static float  quantErr = 0.0f;       // mise en forme du bruit DAC
-static float  envelope = 0.0f;       // suiveur d'enveloppe du gate
+static float  envelope = 0.0f;       // suiveur d'enveloppe RAPIDE du gate
+static float  envSlow  = 0.0f;       // suiveur LENT (mémoire de la note ~170 ms)
 static float  gateGain = 0.0f;       // gain du gate (0..1)
 
 // Étage octave fOXX : passe-haut 1 pôle sur le signal redressé |u|
@@ -558,6 +584,7 @@ static inline void processSample() {
 
     if (fabsf(smLow - eqLowCalc) > 0.002f) {
       calcLowShelf(&fLow, EQ_LOW_HZ, eqDb(smLow));
+      calcTight(&fTight, smLow);       // le pot Low pilote aussi le resserrage
       eqLowCalc = smLow;
     }
     if (fabsf(smMid - eqMidCalc) > 0.002f) {
@@ -580,12 +607,17 @@ static inline void processSample() {
   meterTick((float)raw);
 #endif
 
-  // --- Noise gate : enveloppe mesurée sur l'ENTRÉE (avant tout gain) ---
+  // --- Noise gate INTELLIGENT : enveloppes rapide + lente sur l'ENTRÉE ---
   const float mag = fabsf(x);
-  envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE) * (mag - envelope);
+  envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE)      * (mag - envelope);
+  envSlow  += (mag > envSlow  ? ENV_ATTACK : ENV_RELEASE_SLOW) * (mag - envSlow);
 
-  const float gateScale = 1.0f + GATE_DRIVE_SCALE * smGain
-                               + GATE_DIST_SCALE  * smDist;
+  // Cordes étouffées (chute brutale) ou note tenue (décroissance naturelle) ?
+  const bool abrupt = (envelope < ABRUPT_RATIO * envSlow);
+
+  const float gateScale = (1.0f + GATE_DRIVE_SCALE * smGain
+                                + GATE_DIST_SCALE  * smDist)
+                          * (abrupt ? 1.0f : SUSTAIN_THRESH);
   const float gLow  = GATE_LOW  * gateScale;
   const float gHigh = GATE_HIGH * gateScale;
 
@@ -599,7 +631,9 @@ static inline void processSample() {
     gateTarget = lin * lin;
   }
 
-  gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : GATE_CLOSE_COEF)
+  // Fermeture : franche sur un arrêt net, douce sur une fin de sustain
+  const float closeCoef = abrupt ? GATE_CLOSE_COEF : GATE_CLOSE_SOFT;
+  gateGain += (gateTarget > gateGain ? GATE_OPEN_COEF : closeCoef)
               * (gateTarget - gateGain);
   // Verrou : sous GATE_SNAP le gain est collé à 0 STRICT -> aucune note en
   // cours = aucune sortie du tout (le DAC reste exactement au repos, même
@@ -714,11 +748,8 @@ void setup() {
   calcHin(&fHin);
   calcAmpli(&fAmpli, driveTaper(smGain));
   calcSortie(&fSortie, smTone, smVolume);
-  // Resserrage pré-écrêtage : passe-haut 1er ordre H(s) = s·τ/(1+s·τ)
-  {
-    const float tau = 1.0f / (2.0f * (float)M_PI * TIGHT_HPF_HZ);
-    bilinear1(&fTight, 0.0f, tau, 1.0f, tau);
-  }
+  // Resserrage pré-écrêtage (fréquence pilotée par le pot Low)
+  calcTight(&fTight, smLow);
   // Simulation haut-parleur : passe-bas Butterworth H(s) = 1/(1 + s/(Q·w0) + s²/w0²)
   {
     const float w0 = 2.0f * (float)M_PI * CAB_LPF_HZ;

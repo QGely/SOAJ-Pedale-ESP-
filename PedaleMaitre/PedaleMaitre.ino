@@ -176,6 +176,7 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
     <button data-p="clean">CLEAN<small>cristallin</small></button>
     <button data-p="crunch">CRUNCH<small>rock</small></button>
     <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
+    <button data-p="psycho">PSYCHO<small>solo Muse</small></button>
     <button data-p="foxx">fOXX<small>octave fuzz</small></button>
     <button data-p="metal">METAL<small>serr&eacute; moderne</small></button>
     <button data-p="psyche">PSYCHE<small>p&eacute;dale r&eacute;verbe</small></button>
@@ -280,6 +281,7 @@ var PRESETS={
   clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
   crunch:{g:0.55,d:0.40,o:0.00,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
   muse:{g:0.85,d:0.90,o:0.00,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60},
+  psycho:{g:0.90,d:0.95,o:0.00,b:0.85,m:0.80,h:0.45,t:0.50,v:0.65},
   foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60},
   metal:{g:0.75,d:0.80,o:0.00,b:0.62,m:0.42,h:0.62,t:0.60,v:0.60},
   psyche:{g:0.45,d:0.50,o:0.70,b:0.65,m:0.50,h:0.55,t:0.65,v:0.60}
