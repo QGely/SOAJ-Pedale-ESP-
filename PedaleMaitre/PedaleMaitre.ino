@@ -66,6 +66,7 @@ typedef struct __attribute__((packed)) {
   uint32_t magic;
   float    gain;      // g : drive (0..1)
   float    dist;      // d : saturation (0 = aucune .. 1 = extrême)
+  float    oct;       // o : octave fOXX (0 = off .. 1 = plein octaver)
   float    low;       // b : graves  (0..1, 0.5 = plat, ±12 dB)
   float    mid;       // m : médiums (0..1, 0.5 = plat, ±12 dB)
   float    high;      // h : aigus   (0..1, 0.5 = plat, ±12 dB)
@@ -79,6 +80,7 @@ static PedalParams params = {
   PARAMS_MAGIC,
   0.5f,    // drive
   0.3f,    // dist : léger crunch
+  0.0f,    // oct : octave coupée
   0.5f,    // low  (plat)
   0.5f,    // mid  (plat)
   0.5f,    // high (plat)
@@ -161,24 +163,48 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </header>
 
 <div class="card">
+  <div class="row"><label>P&eacute;dale connect&eacute;e</label></div>
+  <div class="grid" style="grid-template-columns:repeat(2,1fr)" id="pedsel">
+    <button data-m="satu" class="sel">SATU<small>fuzz / EQ / octave</small></button>
+    <button data-m="psyche">PSYCHE<small>disto + r&eacute;verbe</small></button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row"><label>Pr&eacute;sets</label></div>
+  <div class="grid" id="presets">
+    <button data-p="clean">CLEAN<small>cristallin</small></button>
+    <button data-p="crunch">CRUNCH<small>rock</small></button>
+    <button data-p="muse">MUSE<small>fuzz Bellamy</small></button>
+    <button data-p="psycho">PSYCHO<small>solo Muse</small></button>
+    <button data-p="foxx">fOXX<small>octave fuzz</small></button>
+    <button data-p="metal">METAL<small>serr&eacute; moderne</small></button>
+    <button data-p="psyche">PSYCHE<small>p&eacute;dale r&eacute;verbe</small></button>
+  </div>
+</div>
+
+<div class="card">
   <div class="ctl"><div class="row"><label for="g">Drive</label><output id="og">0.50</output></div>
     <input type="range" id="g" min="0" max="1" step="0.01" value="0.5">
     <div class="hint">gain d'entr&eacute;e (pot R5 de la formule) &mdash; pousse l'&eacute;tage de saturation</div></div>
   <div class="ctl"><div class="row"><label for="d">Dist</label><output id="od">0.30</output></div>
     <input type="range" id="d" min="0" max="1" step="0.01" value="0.3">
-    <div class="hint">saturation S(u,d) &mdash; 0 = z&eacute;ro distorsion &rarr; 1 = fuzz extr&ecirc;me</div></div>
+    <div class="hint">0 = CLEAN PUR (signal brut, aucun traitement) &rarr; 1 = fuzz extr&ecirc;me</div></div>
+  <div class="ctl"><div class="row"><label for="o" id="lb_o">Octave</label><output id="oo">0.00</output></div>
+    <input type="range" id="o" min="0" max="1" step="0.01" value="0">
+    <div class="hint" id="hi_o">fOXX Tone Machine &mdash; redressement |u| : la fondamentale devient l'octave sup&eacute;rieure</div></div>
 </div>
 
 <div class="card">
-  <div class="ctl"><div class="row"><label for="b">Low</label><output id="ob">0.50</output></div>
+  <div class="ctl"><div class="row"><label for="b" id="lb_b">Low</label><output id="ob">0.50</output></div>
     <input type="range" id="b" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">graves 100 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
-  <div class="ctl"><div class="row"><label for="m">Mid</label><output id="om">0.50</output></div>
+    <div class="hint" id="hi_b">graves 100 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="m" id="lb_m">Mid</label><output id="om">0.50</output></div>
     <input type="range" id="m" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">m&eacute;diums 700 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
-  <div class="ctl"><div class="row"><label for="h">High</label><output id="oh">0.50</output></div>
+    <div class="hint" id="hi_m">m&eacute;diums 700 Hz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+  <div class="ctl"><div class="row"><label for="h" id="lb_h">High</label><output id="oh">0.50</output></div>
     <input type="range" id="h" min="0" max="1" step="0.01" value="0.5">
-    <div class="hint">aigus 3,2 kHz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
+    <div class="hint" id="hi_h">aigus 3,2 kHz &mdash; 0.5 = plat, &plusmn;12 dB</div></div>
 </div>
 
 <div class="card">
@@ -198,8 +224,8 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
 </div>
 
 <script>
-var KEYS=['g','d','b','m','h','t','v'];
-var st={g:0.5,d:0.3,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
+var KEYS=['g','d','o','b','m','h','t','v'];
+var st={g:0.5,d:0.3,o:0,b:0.5,m:0.5,h:0.5,t:0.5,v:0.5,e:1};
 var timer=null,lastEdit=0;
 function $(id){return document.getElementById(id)}
 function paint(){
@@ -228,6 +254,46 @@ function push(){
 KEYS.forEach(function(k){
   $(k).addEventListener('input',function(){
     st[k]=+this.value;lastEdit=Date.now();paint();push();
+  });
+});
+var LBL={
+ satu:{o:['Octave','fOXX Tone Machine — redressement |u| : la fondamentale devient l\'octave supérieure'],
+       b:['Low','graves 100 Hz — 0.5 = plat, ±12 dB'],
+       m:['Mid','médiums 700 Hz — 0.5 = plat, ±12 dB'],
+       h:['High','aigus 3,2 kHz — 0.5 = plat, ±12 dB']},
+ psyche:{o:['Reverb','mix de réverbération — 0 = sec, 1 = cathédrale'],
+       b:['Decay','durée de la queue de réverbe — 0 = courte, 1 = très longue'],
+       m:['Warble','pulsation psychédélique de la réverbe (2 LFO lents)'],
+       h:['Bright','brillance de la queue de réverbe']}
+};
+function relabel(mode){
+  ['o','b','m','h'].forEach(function(k){
+    $('lb_'+k).textContent=LBL[mode][k][0];
+    $('hi_'+k).textContent=LBL[mode][k][1];
+  });
+  var bs=document.querySelectorAll('#pedsel button');
+  for(var i=0;i<bs.length;i++)bs[i].className=(bs[i].getAttribute('data-m')==mode)?'sel':'';
+}
+document.querySelectorAll('#pedsel button').forEach(function(bt){
+  bt.addEventListener('click',function(){relabel(this.getAttribute('data-m'));});
+});
+var PRESETS={
+  clean:{g:0.30,d:0.00,o:0.00,b:0.50,m:0.50,h:0.50,t:0.60,v:0.60},
+  crunch:{g:0.55,d:0.40,o:0.00,b:0.50,m:0.60,h:0.55,t:0.55,v:0.55},
+  muse:{g:0.85,d:0.90,o:0.00,b:0.60,m:0.75,h:0.55,t:0.45,v:0.60},
+  psycho:{g:0.90,d:0.95,o:0.00,b:0.85,m:0.80,h:0.45,t:0.50,v:0.65},
+  foxx:{g:0.60,d:0.55,o:1.00,b:0.50,m:0.60,h:0.50,t:0.50,v:0.60},
+  metal:{g:0.75,d:0.80,o:0.00,b:0.62,m:0.42,h:0.62,t:0.60,v:0.60},
+  psyche:{g:0.45,d:0.50,o:0.70,b:0.65,m:0.50,h:0.55,t:0.65,v:0.60}
+};
+document.querySelectorAll('#presets button').forEach(function(bt){
+  bt.addEventListener('click',function(){
+    var id=this.getAttribute('data-p');
+    var p=PRESETS[id];
+    for(var k in p)st[k]=p[k];
+    st.e=1;lastEdit=Date.now();
+    relabel(id=='psyche'?'psyche':'satu');
+    paint();push();
   });
 });
 $('fsw').addEventListener('click',function(){
@@ -261,8 +327,8 @@ static void sendParamsEspNow() {
 }
 
 static void logParams(const char *src) {
-  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
-                src, params.gain, params.dist, params.low, params.mid,
+  Serial.printf("[%s] Paramètres : G=%.2f D=%.2f O=%.2f B=%.2f M=%.2f H=%.2f T=%.2f V=%.2f E=%d\n",
+                src, params.gain, params.dist, params.oct, params.low, params.mid,
                 params.high, params.tone, params.volume, params.effectOn);
 }
 
@@ -273,14 +339,14 @@ static void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// GET /api/get  ->  {"g":0.50,"d":0.30,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
+// GET /api/get -> {"g":0.50,"d":0.30,"o":0.00,"b":0.50,"m":0.50,"h":0.50,"t":0.50,"v":0.50,"e":1}
 static void handleApiGet() {
-  char buf[144];
+  char buf[160];
   snprintf(buf, sizeof(buf),
-           "{\"g\":%.2f,\"d\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
+           "{\"g\":%.2f,\"d\":%.2f,\"o\":%.2f,\"b\":%.2f,\"m\":%.2f,\"h\":%.2f,"
            "\"t\":%.2f,\"v\":%.2f,\"e\":%d}",
-           params.gain, params.dist, params.low, params.mid, params.high,
-           params.tone, params.volume, params.effectOn);
+           params.gain, params.dist, params.oct, params.low, params.mid,
+           params.high, params.tone, params.volume, params.effectOn);
   server.send(200, "application/json", buf);
 }
 
@@ -289,6 +355,7 @@ static void handleApiSet() {
   bool changed = false;
   if (server.hasArg("g")) { params.gain   = clampf(server.arg("g").toFloat(), GAIN_MIN, GAIN_MAX);     changed = true; }
   if (server.hasArg("d")) { params.dist   = clampf(server.arg("d").toFloat(), 0.0f, 1.0f);             changed = true; }
+  if (server.hasArg("o")) { params.oct    = clampf(server.arg("o").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("b")) { params.low    = clampf(server.arg("b").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("m")) { params.mid    = clampf(server.arg("m").toFloat(), 0.0f, 1.0f);             changed = true; }
   if (server.hasArg("h")) { params.high   = clampf(server.arg("h").toFloat(), 0.0f, 1.0f);             changed = true; }
@@ -335,6 +402,7 @@ static void parseCommand(const String &cmd) {
     switch (key) {
       case 'G': params.gain   = clampf(v, GAIN_MIN, GAIN_MAX);       changed = true; break;
       case 'D': params.dist   = clampf(v, 0.0f, 1.0f);               changed = true; break;
+      case 'O': params.oct    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'B': params.low    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'M': params.mid    = clampf(v, 0.0f, 1.0f);               changed = true; break;
       case 'H': params.high   = clampf(v, 0.0f, 1.0f);               changed = true; break;
@@ -407,7 +475,7 @@ void setup() {
   server.begin();
 
   Serial.println("[Web] Serveur démarré. Connectez le téléphone au WiFi puis ouvrez http://192.168.4.1");
-  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
+  Serial.println("[Série] Commandes acceptées aussi ici, ex : G:0.8;D:0.5;O:1;B:0.5;M:0.6;H:0.4;T:0.4;V:0.6;E:1");
 }
 
 // ---------------------------------------------------------------------------
