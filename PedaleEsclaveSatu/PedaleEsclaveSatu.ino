@@ -416,6 +416,9 @@ static float  quantErr = 0.0f;       // mise en forme du bruit DAC
 static float  envelope = 0.0f;       // suiveur d'enveloppe RAPIDE du gate
 static float  envSlow  = 0.0f;       // suiveur LENT (mémoire de la note ~170 ms)
 static float  gateGain = 0.0f;       // gain du gate (0..1)
+// Passe-haut 120 Hz pour la MESURE d'enveloppe uniquement : la ronflette
+// secteur (50/100/150 Hz) captée par le câblage ne tient plus le gate ouvert
+static float  envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 
 // Étage octave fOXX : passe-haut 1 pôle sur le signal redressé |u|
 // (émule la liaison 10 µF qui retire la composante continue 2/π)
@@ -608,7 +611,13 @@ static inline void processSample() {
 #endif
 
   // --- Noise gate INTELLIGENT : enveloppes rapide + lente sur l'ENTRÉE ---
-  const float mag = fabsf(x);
+  // La mesure passe d'abord par un passe-haut 120 Hz : le ronflement secteur
+  // capté par les fils volants n'ouvre/ne retient plus le gate (le mi grave
+  // 82 Hz garde ses harmoniques bien au-dessus de 120 Hz : il ouvre normalement)
+  const float eh = envHpA * (envHpY + x - envHpX);
+  envHpX = x;
+  envHpY = eh;
+  const float mag = fabsf(eh);
   envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE)      * (mag - envelope);
   envSlow  += (mag > envSlow  ? ENV_ATTACK : ENV_RELEASE_SLOW) * (mag - envSlow);
 
@@ -707,7 +716,10 @@ static inline void processSample() {
   int dacVal = (int)lroundf(desired);
   if (dacVal < 0)   dacVal = 0;
   if (dacVal > 255) dacVal = 255;
-  quantErr = desired - (float)dacVal;
+  // Mise en forme du bruit PARTIELLE (x0.5) : la version pleine concentrait
+  // le bruit de quantification du DAC 8 bits en une bande 6-9 kHz — le
+  // "scratch" fin entendu en continu. À 0.5 le bruit reste mieux réparti.
+  quantErr = (desired - (float)dacVal) * 0.5f;
   if (quantErr >  1.0f) quantErr =  1.0f;
   if (quantErr < -1.0f) quantErr = -1.0f;
 
@@ -750,6 +762,11 @@ void setup() {
   calcSortie(&fSortie, smTone, smVolume);
   // Resserrage pré-écrêtage (fréquence pilotée par le pot Low)
   calcTight(&fTight, smLow);
+  // Passe-haut 120 Hz de la mesure d'enveloppe du gate (anti-ronflette)
+  {
+    const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
+    envHpA = rc / (rc + DT_SEC);
+  }
   // Simulation haut-parleur : passe-bas Butterworth H(s) = 1/(1 + s/(Q·w0) + s²/w0²)
   {
     const float w0 = 2.0f * (float)M_PI * CAB_LPF_HZ;

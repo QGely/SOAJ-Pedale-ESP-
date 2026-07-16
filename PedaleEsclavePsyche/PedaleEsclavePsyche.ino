@@ -155,6 +155,8 @@ static volatile float tgtEffect = 1.0f;
 static float dcOffset  = 2048.0f;
 static float envelope  = 0.0f;
 static float gateGain  = 0.0f;
+// Passe-haut 120 Hz pour la mesure d'enveloppe (anti-ronflette secteur)
+static float envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 static float lpTone    = 0.0f;      // passe-bas de tone (1 pôle)
 static float quantErr  = 0.0f;
 
@@ -303,7 +305,12 @@ static inline void processSample() {
 #endif
 
   // --- Noise gate à l'entrée (la queue de réverbe, elle, sonne librement) ---
-  const float mag = fabsf(x);
+  // Mesure d'enveloppe passe-haut 120 Hz : la ronflette secteur ne tient
+  // plus le gate ouvert
+  const float eh = envHpA * (envHpY + x - envHpX);
+  envHpX = x;
+  envHpY = eh;
+  const float mag = fabsf(eh);
   envelope += (mag > envelope ? ENV_ATTACK : ENV_RELEASE) * (mag - envelope);
   const float gateScale = 1.0f + GATE_DRIVE_SCALE * smGain + GATE_DIST_SCALE * smDist;
   const float gLow  = GATE_LOW  * gateScale;
@@ -376,7 +383,9 @@ static inline void processSample() {
   int dacVal = (int)lroundf(desired);
   if (dacVal < 0)   dacVal = 0;
   if (dacVal > 255) dacVal = 255;
-  quantErr = desired - (float)dacVal;
+  // Mise en forme du bruit PARTIELLE (x0.5) : évite de concentrer le bruit
+  // de quantification du DAC 8 bits en une bande 6-9 kHz ("scratch" continu)
+  quantErr = (desired - (float)dacVal) * 0.5f;
   if (quantErr >  1.0f) quantErr =  1.0f;
   if (quantErr < -1.0f) quantErr = -1.0f;
 
@@ -405,6 +414,12 @@ void setup() {
 #endif
 
   dacWrite(PIN_AUDIO_OUT, 128);
+
+  // Passe-haut 120 Hz de la mesure d'enveloppe du gate (anti-ronflette)
+  {
+    const float rc = 1.0f / (2.0f * (float)M_PI * 120.0f);
+    envHpA = rc / (rc + DT_SEC);
+  }
 
   // Buffers de réverbe à zéro (silence initial)
   memset(comb1, 0, sizeof(comb1)); memset(comb2, 0, sizeof(comb2));
