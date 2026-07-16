@@ -25,7 +25,7 @@ Téléphone ──(WiFi + page web)──> ESP32 MAÎTRE ──(ESP-NOW)──> 
 |---|---|---|
 | `PedaleMaitre/` | ESP32 n°1 | Point d'accès WiFi + page web de réglage, diffuse en ESP-NOW |
 | `PedaleEsclave/` | ESP32 n°N | Reçoit les paramètres, traite l'audio guitare, sortie DAC |
-| `PedaleNam/` | **1 seul ESP32** | **Projet à part** : pédale autonome qui charge des captures TONE3000 (.nam) importées depuis le téléphone — voir la section dédiée en bas |
+| `PedaleNam/` | **1 seul ESP32** | **Projet à part** : pédale autonome avec le catalogue TONE3000 intégré à sa page (choix, téléchargement et mémorisation de 8 pédales) — voir la section dédiée en bas |
 
 Compiler avec l'Arduino IDE, carte **« ESP32 Dev Module »** (cartes ELEGOO ESP32 CP2102).
 Aucune bibliothèque externe : tout est inclus dans le core ESP32 (WiFi, WebServer,
@@ -332,41 +332,62 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 
 ---
 
-## PedaleNam — projet à part : 1 ESP32 + captures TONE3000 importées du téléphone
+## PedaleNam — projet à part : 1 ESP32 avec le catalogue TONE3000 intégré
 
 `PedaleNam/` est une pédale **autonome et indépendante** du duo maître/esclave :
-un **seul ESP32** fait le point d'accès WiFi, la page web ET l'audio
-(mêmes câblages d'entrée/sortie que les autres pédales).
+un **seul ESP32** (mêmes câblages d'entrée/sortie que les autres pédales), et
+le **catalogue tone3000.com directement dans la page de la pédale**.
 
 ```
-Téléphone ──(WiFi + page web)──> ESP32 unique ──> Ampli
- │  http://192.168.4.1                 ▲
- │                             Guitare (jack, ADC GPIO34)
- └── fichier .nam téléchargé sur tone3000.com
+                Internet (4G du téléphone)
+                     ▲
+                     │ partage de connexion (hotspot)
+Téléphone ───────────┤
+  navigateur ────────┼──> page web DANS l'ESP32 (http://soaj-nam.local)
+    « CHOISIR SUR    │
+      TONE3000 »     │
+                     ▼
+                 ESP32 : relaie l'API TONE3000, télécharge la capture .nam,
+                 la page l'analyse sur le téléphone, le profil est gravé
+                 dans un des 8 SLOTS mémorisés
+                     │
+     Guitare ──> GPIO34 (ADC) … GPIO25 (DAC) ──> Ampli   (audio 100 % local)
 ```
 
-### Le principe
+### Pourquoi le partage de connexion
 
-Un fichier `.nam` (Neural Amp Modeler, le format de tone3000.com) est un
-réseau de neurones : bien trop lourd pour tourner en temps réel sur un ESP32.
-L'astuce : **c'est le téléphone qui l'exécute**, pas l'ESP32.
+Le téléphone **garde son Internet** (plus de « ce réseau n'a pas d'accès
+Internet », plus de portail captif) et en fait profiter la pédale, qui se sert
+elle-même dans le catalogue via l'**API officielle TONE3000** (OAuth PKCE —
+leurs flux prévoient explicitement le matériel embarqué). L'ESP32 n'est
+**jamais** connecté à autre chose que le téléphone.
 
-1. Sur le téléphone (avec Internet), télécharger une capture `.nam` de pédale
-   sur [tone3000.com](https://www.tone3000.com).
-2. Se connecter au WiFi **`SOAJ-NAM`** (mdp `soaj1234`), la page s'ouvre
-   (portail captif).
-3. **Importer le fichier .nam** : le JavaScript de la page exécute le réseau
-   (WaveNet et LSTM gérés, disposition des poids conforme à
-   NeuralAmpModelerCore), mesure sa courbe d'écrêtage (257 points, crêtes
-   positives et négatives séparées = asymétrie préservée) et sa réponse en
-   fréquence (sinus par paliers + Goertzel), puis n'envoie à l'ESP32 que ce
-   **profil** de ~2,5 Ko. L'analyse prend de quelques secondes à ~1 minute
-   selon le téléphone et la taille du modèle — une seule fois par capture.
-4. L'ESP32 grave le profil en flash (il **survit à l'extinction**) et le joue
-   en temps réel à 20 kHz : drive log → passe-haut → passe-bas → courbe
-   d'écrêtage interpolée → médiums → passe-bas de voicing → tone → volume,
-   avec le même gate, les mêmes anti-parasites et le même DAC sigma-delta
-   que les autres pédales du dépôt. Changement de profil **en fondu**, sans clic.
+### Installation (une seule fois)
+
+1. Créer une **clé API** sur son compte tone3000.com (Réglages → API Keys →
+   clé publiable `t3k_pub_…`) et y autoriser l'adresse de redirection que la
+   page affiche (section Configuration).
+2. Activer le **partage de connexion** du téléphone, ouvrir la page de la
+   pédale, renseigner le nom/mot de passe du partage + coller la clé API.
+   (La toute première fois, la page s'ouvre par le WiFi propre de la pédale
+   `SOAJ-NAM` / mdp `soaj1234` — couper les données mobiles pour cet accès-là,
+   ou taper `http://192.168.4.1` avec le préfixe `http://`.)
+
+### Utilisation (plug and play)
+
+1. Partage de connexion ON → pédale ON (elle rejoint toute seule) →
+   `http://soaj-nam.local`.
+2. **CHOISIR SUR TONE3000** : le vrai catalogue s'ouvre (le téléphone a
+   Internet), on navigue, on choisit une pédale, retour automatique à la page.
+3. La pédale **télécharge la capture elle-même**, le téléphone **l'analyse**
+   (moteur NAM en JavaScript — WaveNet et LSTM, conforme à
+   NeuralAmpModelerCore, de quelques secondes à ~1 min), et le profil
+   (~2,5 Ko) est **gravé dans le slot choisi**. Prêt à jouer.
+4. Les **8 slots** se rappellent d'un appui, **sans Internet ni hotspot**
+   (fondu anti-clic, mémorisés pour toujours).
+
+L'import manuel d'un fichier `.nam` déjà téléchargé reste disponible en bas
+de page (secours — marche sans compte TONE3000).
 
 ### Réglages sur la page
 
@@ -377,42 +398,44 @@ L'astuce : **c'est le téléphone qui l'exécute**, pas l'ESP32.
 | Tone | passe-bas final, 0 = sombre → 1 = brillant |
 | Volume | niveau de sortie |
 
-API : `GET /api/get`, `GET /api/set?g=&d=&t=&v=&e=`,
-`POST /api/profil` (JSON du profil — c'est ce qu'envoie la page).
+API locale : `GET /api/get`, `GET /api/set?g=&d=&t=&v=&e=`,
+`GET /api/slot?n=`, `POST /api/profil?slot=n` (JSON du profil),
+`GET /api/hotspot?ssid=&mdp=`, `GET /api/t3kcle?cle=`,
+et le relais TONE3000 : `POST /t3k/token`, `GET /t3k/modeles?tone_id=`,
+`POST /t3k/telecharger?url=`, `GET /t3k/fichier`.
 
-### La page ne s'ouvre pas ? (« ce réseau n'a pas d'accès Internet »)
+### La page ne s'ouvre pas en mode WiFi SOAJ-NAM ? (première configuration)
 
 C'est le téléphone qui bloque, pas la pédale — **aucune connexion Internet
-n'est nécessaire**, il faut juste l'empêcher de contourner le WiFi local :
+n'est nécessaire** pour ce mode :
 
-1. **Couper les données mobiles (4G/5G)** le temps du réglage : sinon le
-   téléphone envoie les requêtes par le réseau mobile et `192.168.4.1`
-   n'aboutit jamais.
+1. **Couper les données mobiles (4G/5G)** le temps du réglage.
 2. À l'avertissement « ce réseau n'a pas d'accès Internet », répondre
    **« Rester connecté »** (Android) ou **« Utiliser sans Internet »** (iOS).
-3. Si la fenêtre ne s'ouvre pas toute seule, taper **`http://192.168.4.1`**
-   dans le navigateur — **avec le préfixe `http://`** : tapé nu, Chrome force
-   le HTTPS et affiche « pas de connexion ». `http://soaj-nam.local` marche
-   aussi (mDNS, pratique sur iPhone et PC).
-4. Pour l'import du `.nam`, préférez un vrai navigateur (Safari/Chrome) à la
-   petite fenêtre de connexion du portail : ouvrez `http://192.168.4.1`
-   à la main.
+3. Taper **`http://192.168.4.1`** — **avec le préfixe `http://`** (tapé nu,
+   Chrome force le HTTPS). `http://soaj-nam.local` marche aussi.
 
-Le croquis répond de lui-même aux sondes de détection de portail
-d'Android, iOS, Windows et Firefox : sur la plupart des téléphones la
-fenêtre s'ouvre seule une fois les données mobiles coupées.
+(Une fois le partage de connexion configuré, ce problème disparaît : le
+téléphone garde Internet et la page se sert normalement.)
 
 ### Limites honnêtes
 
-Le profil garde le **caractère statique** de la capture (courbe de saturation,
-asymétrie, équilibre spectral) mais pas sa **dynamique fine** (le réseau
-complet réagit à l'enveloppe du jeu). Ça marche très bien pour les pédales de
-saturation/disto/fuzz ; pour un ampli complet capturé avec son grain dynamique,
-la capture NAM d'origine sur un vrai moteur NAM (PC, Daisy Seed…) reste la
-référence. Sans surprise, la qualité est aussi bornée par les convertisseurs
-de l'ESP32 (ADC 12 bits, DAC 8 bits + sigma-delta).
+- Le profil garde le **caractère statique** de la capture (courbe de
+  saturation, asymétrie, équilibre spectral) mais pas sa **dynamique fine** :
+  très bien pour les pédales de saturation/disto/fuzz, moins fidèle pour un
+  ampli complet au grain très dynamique — la capture NAM d'origine sur un
+  vrai moteur NAM reste la référence.
+- Qualité bornée par les convertisseurs de l'ESP32 (ADC 12 bits, DAC 8 bits
+  + sigma-delta).
+- Le HTTPS vérifie le certificat de tone3000.com avec la racine embarquée
+  (ISRG/Let's Encrypt, valable 2035) ; en cas de changement d'autorité chez
+  eux, passer `T3K_TLS_STRICT` à 0 le temps d'une mise à jour.
+- L'écriture flash d'un profil peut faire un bref craquement (une fois par
+  import).
 
-> Vérifié par simulation : croquis compilé hors carte et alimenté avec le
-> profil réellement produit par le moteur JavaScript sur les modèles d'exemple
-> officiels de NeuralAmpModelerCore (comptage des poids exact, WaveNet et
-> LSTM) — silence strict au repos, échange de profil sans saut, aucun NaN.
+> Vérifié par simulation : croquis compilé hors carte (audio, slots NVS,
+> analyse du JSON, bascule en fondu), moteur JavaScript validé sur les modèles
+> d'exemple officiels de NeuralAmpModelerCore (comptage des poids exact,
+> WaveNet et LSTM), SHA-256 du flux OAuth vérifié contre l'implémentation de
+> référence de node. Le flux réseau réel (OAuth, téléchargement) reste à
+> valider sur le matériel avec une vraie clé API.

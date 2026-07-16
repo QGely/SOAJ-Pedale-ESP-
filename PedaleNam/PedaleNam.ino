@@ -1,53 +1,58 @@
 /*
  * ============================================================================
  *  SOAJ - Pédale d'effet guitare ESP32
- *  PedaleNam.ino  —  PROJET AUTONOME : 1 seul ESP32 + captures TONE3000 (NAM)
+ *  PedaleNam.ino  —  PROJET AUTONOME : 1 ESP32 + catalogue TONE3000 intégré
  * ============================================================================
  *
- *  Téléphone ──(WiFi + page web)──> ESP32 unique ──> Ampli
- *   │  http://192.168.4.1                ▲
- *   │                            Guitare (jack, ADC GPIO34)
- *   └── fichier .nam téléchargé sur tone3000.com
+ *                     Internet (4G du téléphone)
+ *                          ▲
+ *                          │ partage de connexion (hotspot)
+ *   TÉLÉPHONE ─────────────┤
+ *     navigateur ──────────┼──> page web DANS l'ESP32 (http://soaj-nam.local)
+ *       │  « CHOISIR SUR TONE3000 » → catalogue officiel tone3000.com
+ *       ▼                  │
+ *   ESP32 (station WiFi) ──┘   + point d'accès SOAJ-NAM (secours/config)
+ *       │   ① relaie l'API TONE3000 (OAuth PKCE, HTTPS)
+ *       │   ② télécharge la capture .nam choisie (LittleFS)
+ *       │   ③ la page l'analyse sur le TÉLÉPHONE (moteur NAM en JS)
+ *       │   ④ le profil (~2,5 Ko) est gravé dans un des 8 SLOTS (NVS)
+ *       ▼
+ *   Guitare -> GPIO34 (ADC) … GPIO25 (DAC) -> Ampli  (audio 100 % local)
  *
- *  Le principe :
- *    1. Sur le téléphone, télécharger une capture .nam depuis tone3000.com
- *       (Neural Amp Modeler — réseau de neurones, bien trop lourd pour
- *       tourner en temps réel sur un ESP32).
- *    2. Se connecter au WiFi de la pédale, ouvrir la page, IMPORTER le .nam :
- *       le JavaScript de la page EXÉCUTE le réseau NAM sur le téléphone
- *       (WaveNet et LSTM gérés, quelques dizaines de secondes, une seule
- *       fois), mesure sa courbe d'écrêtage et sa réponse en fréquence, et
- *       n'envoie à l'ESP32 que le PROFIL extrait (~2,5 Ko).
- *    3. L'ESP32 grave le profil en flash (NVS) et le joue en temps réel à
- *       20 kHz : drive log -> passe-haut -> passe-bas -> COURBE D'ÉCRÊTAGE
- *       mesurée (257 points interpolés) -> médiums -> passe-bas de voicing
- *       -> tone -> volume. Gate, anti-parasites et sigma-delta identiques
- *       aux autres pédales du dépôt.
+ *  L'expérience visée (« plug and play ») :
+ *    - Une fois : entrer le nom/mot de passe du partage de connexion dans la
+ *      page + coller sa clé API TONE3000 (tone3000.com -> Réglages -> API
+ *      Keys -> clé publiable t3k_pub_…).
+ *    - Ensuite : hotspot ON -> pédale ON -> page -> « CHOISIR SUR TONE3000 »
+ *      -> le VRAI catalogue s'ouvre (le téléphone a Internet) -> choisir une
+ *      pédale -> retour automatique -> la pédale télécharge la capture,
+ *      le téléphone l'analyse (moteur NAM JavaScript, WaveNet + LSTM),
+ *      le profil est gravé dans le slot choisi. Les 8 slots se rappellent
+ *      ensuite SANS hotspot ni Internet.
  *
- *  L'approximation garde le caractère statique de la capture (courbe de
- *  saturation, équilibre spectral) mais pas sa dynamique fine — c'est la
- *  limite d'un ESP32 seul, discutée dans le README.
+ *  Pourquoi cette répartition :
+ *    - un réseau de neurones NAM ne peut pas tourner en temps réel sur un
+ *      ESP32 -> l'analyse (une seule fois, non temps réel) se fait sur le
+ *      téléphone, qui est fait pour ça ;
+ *    - l'ESP32 relaie les appels API (jetons OAuth gardés dans la pédale,
+ *      aucun souci de CORS, n'importe quel téléphone peut piloter) ;
+ *    - l'audio reste local et n'est JAMAIS interrompu (cœur 1 dédié).
  *
- *  Répartition des cœurs (un seul ESP32 fait radio ET audio) :
- *    - cœur 1 : tâche audio temps réel (boucle serrée, WDT désactivé)
- *    - cœur 0 : WiFi/portail captif/serveur web (tâche à basse priorité,
- *      delay(2) à chaque tour pour laisser vivre la pile WiFi)
- *  AUCUN audio ne transite par WiFi : uniquement paramètres et profil.
- *
- *  IMPORTANT — matériel : identique aux autres pédales (GPIO34 polarisé à
- *  1,65 V par pont diviseur + condensateur de liaison, DAC GPIO25 filtré —
- *  voir README.md). L'import d'un profil écrit en flash : bref craquement
- *  possible à cet instant, c'est normal (une seule fois par import).
- *
- *  Carte : ELEGOO ESP32 (NodeMCU-like, CP2102) — Arduino IDE, "ESP32 Dev Module".
+ *  Cartes/outils : ELEGOO ESP32 (NodeMCU-like) — Arduino IDE, carte
+ *  « ESP32 Dev Module », schéma de partition par défaut (l'appli + LittleFS
+ *  pour le fichier .nam téléchargé). Câblage : voir README (pont diviseur
+ *  1,65 V sur GPIO34, filtre RC sur GPIO25).
  * ============================================================================
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <math.h>
 
 // Lecture ADC rapide (~10 µs) via le pilote bas niveau.
@@ -99,9 +104,19 @@
 #define PROF_FADE_STEP      0.0015f   // fondu anti-clic au changement de profil
 #define DEBUG_METER         0
 
+// --- TONE3000 ---------------------------------------------------------------
+#define T3K_HOTE            "https://www.tone3000.com"
+// 1 = vérifier le certificat (racine ISRG/Let's Encrypt embarquée plus bas).
+// Si TONE3000 change un jour d'autorité de certification, passer à 0 le
+// temps d'une mise à jour (connexion toujours chiffrée, mais non vérifiée).
+#define T3K_TLS_STRICT      1
+#define FICHIER_NAM         "/capture.nam"   // capture téléchargée (LittleFS)
+
+// --- Slots de profils mémorisés ----------------------------------------------
+#define NB_SLOTS 8
+
 // ---------------------------------------------------------------------------
 // Profil de pédale : ce que le téléphone extrait du .nam et nous envoie
-// (mêmes champs que PedaleEsclaveSatu/profils_pedales.h)
 // ---------------------------------------------------------------------------
 #define LUT_TAILLE 257        // points de la courbe d'écrêtage
 #define LUT_PLAGE  4.0f       // la courbe couvre u dans [-LUT_PLAGE, +LUT_PLAGE]
@@ -123,6 +138,9 @@ static ProfilNam profilActif;             // joué par la tâche audio
 static ProfilNam profilRecu;              // rempli par le serveur web
 static volatile bool profilEnAttente = false;   // vrai -> l'audio l'échange
 
+static uint8_t slotActif = 0;
+static char    nomsSlots[NB_SLOTS][24];   // cache des noms ("" = slot vide)
+
 // Cibles pilotées par la page web
 static volatile float tgtDrive  = 0.5f;   // g : position du pot drive (0..1)
 static volatile float tgtMix    = 1.0f;   // d : intensité (0 = clean pur)
@@ -133,6 +151,10 @@ static volatile float tgtEffect = 1.0f;   // e : 0 = bypass, 1 = effet
 static Preferences prefs;
 static WebServer   server(80);
 static DNSServer   dnsServer;
+
+// Identifiants du partage de connexion (mémorisés en flash)
+static char hsSsid[33] = "";
+static char hsMdp[65]  = "";
 
 // ---------------------------------------------------------------------------
 // Biquad IIR + transformation bilinéaire (identique aux autres pédales)
@@ -247,7 +269,7 @@ static inline int readAdcOnce() {
 #endif
 }
 
-// Médiane de 3 lectures : élimine les pics parasites WiFi de l'ADC
+// Médiane de 3 lectures : élimine les pics parasites radio de l'ADC
 static inline int readGuitarAdc() {
   const int a = readAdcOnce();
   const int b = readAdcOnce();
@@ -269,10 +291,13 @@ static inline float lireCourbe(const float *lut, float u) {
 }
 
 // ---------------------------------------------------------------------------
-// Profil : bornage, filtres, profil neutre de démarrage, sauvegarde NVS
+// Profil : bornage, filtres, profil neutre, slots NVS
 // ---------------------------------------------------------------------------
 static void bornerProfil(ProfilNam *p) {
   p->nom[sizeof(p->nom) - 1] = '\0';
+  // Le nom part dans du JSON construit à la main : on neutralise " et antislash
+  for (size_t i = 0; p->nom[i]; i++)
+    if (p->nom[i] == '"' || p->nom[i] == '\\') p->nom[i] = '\'';
   p->preHpfHz   = clampf(p->preHpfHz,   20.0f, 2000.0f);
   p->preLpfHz   = clampf(p->preLpfHz,  1000.0f, 9000.0f);
   p->gainMin    = clampf(p->gainMin,     0.5f, 100.0f);
@@ -322,16 +347,37 @@ static void profilNeutre(ProfilNam *p) {
   }
 }
 
-// NVS : le profil survit à l'extinction (écrit UNE fois par import)
-static void sauverProfilNVS(const ProfilNam *p) {
-  prefs.putBytes("profil", p, sizeof(*p));
+// --- Slots NVS : 8 profils mémorisés, survivent à l'extinction ---
+static void cleSlot(int n, char *buf, size_t taille) {
+  snprintf(buf, taille, "prof%d", n);
 }
 
-static bool chargerProfilNVS(ProfilNam *p) {
-  if (prefs.getBytesLength("profil") != sizeof(*p)) return false;
-  prefs.getBytes("profil", p, sizeof(*p));
+static bool chargerSlotNVS(int n, ProfilNam *p) {
+  char cle[12];
+  cleSlot(n, cle, sizeof(cle));
+  if (prefs.getBytesLength(cle) != sizeof(*p)) return false;
+  prefs.getBytes(cle, p, sizeof(*p));
   bornerProfil(p);
   return true;
+}
+
+static void sauverSlotNVS(int n, const ProfilNam *p) {
+  char cle[12];
+  cleSlot(n, cle, sizeof(cle));
+  prefs.putBytes(cle, p, sizeof(*p));
+  strncpy(nomsSlots[n], p->nom, sizeof(nomsSlots[n]) - 1);
+  nomsSlots[n][sizeof(nomsSlots[n]) - 1] = '\0';
+}
+
+static void chargerNomsSlots() {
+  ProfilNam tmp;
+  for (int n = 0; n < NB_SLOTS; n++) {
+    nomsSlots[n][0] = '\0';
+    if (chargerSlotNVS(n, &tmp)) {
+      strncpy(nomsSlots[n], tmp.nom, sizeof(nomsSlots[n]) - 1);
+      nomsSlots[n][sizeof(nomsSlots[n]) - 1] = '\0';
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,22 +393,26 @@ static bool jsonFloat(const char *s, const char *cle, float *out) {
   return true;
 }
 
+// Extrait une valeur chaîne : "cle":"valeur"
+static bool jsonChaine(const char *s, const char *cle, char *out, size_t taille) {
+  const char *p = strstr(s, cle);
+  if (!p) return false;
+  p = strchr(p + strlen(cle), ':');
+  if (!p) return false;
+  p = strchr(p, '"');
+  if (!p) return false;
+  p++;
+  size_t i = 0;
+  while (*p && *p != '"' && i < taille - 1) out[i++] = *p++;
+  out[i] = '\0';
+  return true;
+}
+
 static bool parseProfilJson(const char *s, ProfilNam *p) {
   memset(p, 0, sizeof(*p));
 
-  // nom : première chaîne après "nom":
-  const char *n = strstr(s, "\"nom\"");
-  if (n) {
-    n = strchr(n + 5, ':');
-    if (n) n = strchr(n, '"');
-    if (n) {
-      n++;
-      size_t i = 0;
-      while (*n && *n != '"' && i < sizeof(p->nom) - 1) p->nom[i++] = *n++;
-      p->nom[i] = '\0';
-    }
-  }
-  if (p->nom[0] == '\0') strncpy(p->nom, "SANS NOM", sizeof(p->nom) - 1);
+  if (!jsonChaine(s, "\"nom\"", p->nom, sizeof(p->nom)) || p->nom[0] == '\0')
+    strncpy(p->nom, "SANS NOM", sizeof(p->nom) - 1);
 
   bool ok = true;
   ok &= jsonFloat(s, "\"preHpfHz\"",   &p->preHpfHz);
@@ -394,9 +444,7 @@ static bool parseProfilJson(const char *s, ProfilNam *p) {
 }
 
 // ---------------------------------------------------------------------------
-// Sigma-delta du DAC + dither TPDF (identique aux autres pédales : repousse
-// le bruit de quantification 8 bits vers l'ultrasonique, casse les cycles
-// limites qui sifflent)
+// Sigma-delta du DAC + dither TPDF (identique aux autres pédales)
 // ---------------------------------------------------------------------------
 static uint32_t ditherSeed = 0x9ABC1234u;
 static inline float ditherTpdf() {
@@ -464,8 +512,7 @@ static inline void processSample() {
   dcOffset += DC_TRACK_COEF * ((float)raw - dcOffset);
   const float x = ((float)raw - dcOffset) * (INPUT_GAIN / 2048.0f);
 
-  // --- Noise gate : enveloppe mesurée derrière un passe-haut 120 Hz
-  //     (la ronflette secteur ne tient pas le gate ouvert) ---
+  // --- Noise gate : enveloppe mesurée derrière un passe-haut 120 Hz ---
   const float eh = envHpA * (envHpY + x - envHpX);
   envHpX = x;
   envHpY = eh;
@@ -520,10 +567,129 @@ static inline void processSample() {
 }
 
 // ---------------------------------------------------------------------------
-// Page web (embarquée en flash) : jauges + import de capture .nam.
-// Le JavaScript contient un MOTEUR NAM complet (WaveNet + LSTM, disposition
-// des poids conforme à NeuralAmpModelerCore) : le réseau tourne sur le
-// TÉLÉPHONE pour la calibration, jamais sur l'ESP32.
+// Client TONE3000 : l'ESP32 relaie l'API officielle (HTTPS + OAuth PKCE).
+// Les jetons vivent dans la pédale (NVS) : n'importe quel téléphone pilote,
+// et la page n'a aucun souci de CORS (elle ne parle qu'à l'ESP32).
+// ---------------------------------------------------------------------------
+// Racine ISRG Root X1 (Let's Encrypt — utilisée par tone3000.com), valable
+// jusqu'en 2035. Source : paquet certifi (bundle Mozilla).
+static const char ISRG_ROOT_X1[] PROGMEM =
+  "-----BEGIN CERTIFICATE-----\n"
+  "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
+  "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n"
+  "cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4\n"
+  "WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu\n"
+  "ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY\n"
+  "MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc\n"
+  "h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+\n"
+  "0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U\n"
+  "A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW\n"
+  "T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH\n"
+  "B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC\n"
+  "B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv\n"
+  "KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn\n"
+  "OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn\n"
+  "jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw\n"
+  "qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI\n"
+  "rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV\n"
+  "HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq\n"
+  "hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL\n"
+  "ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ\n"
+  "3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK\n"
+  "NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5\n"
+  "ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur\n"
+  "TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC\n"
+  "jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc\n"
+  "oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq\n"
+  "4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA\n"
+  "mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n"
+  "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n"
+  "-----END CERTIFICATE-----\n";
+
+// Encodage pour corps x-www-form-urlencoded (suffisant pour nos valeurs)
+static String urlEncode(const String &s) {
+  String out;
+  const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    const char c = s.c_str()[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0xF];
+      out += hex[c & 0xF];
+    }
+  }
+  return out;
+}
+
+// Requête HTTPS vers tone3000.com. corps vide = GET, sinon POST formulaire.
+// Retourne le code HTTP (<= 0 = échec réseau/TLS) et remplit `reponse`.
+static int t3kRequete(const String &url, const String &corps,
+                      const String &bearer, String &reponse) {
+  WiFiClientSecure tls;
+#if T3K_TLS_STRICT
+  tls.setCACert(ISRG_ROOT_X1);
+#else
+  tls.setInsecure();                 // chiffré mais non vérifié (dépannage)
+#endif
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+  if (!http.begin(tls, url)) return -1;
+  if (bearer.length()) http.addHeader("Authorization", String("Bearer ") + bearer);
+  int code;
+  if (corps.length()) {
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    code = http.POST(corps);
+  } else {
+    code = http.GET();
+  }
+  if (code > 0) reponse = http.getString();
+  http.end();
+  return code;
+}
+
+// Échange (ou rafraîchit) les jetons OAuth et les grave en NVS
+static bool t3kStockerJetons(const String &reponse) {
+  char acc[512], ref[512];
+  if (!jsonChaine(reponse.c_str(), "\"access_token\"", acc, sizeof(acc))) return false;
+  if (!jsonChaine(reponse.c_str(), "\"refresh_token\"", ref, sizeof(ref))) return false;
+  prefs.putString("t3kAcc", acc);
+  prefs.putString("t3kRef", ref);
+  return true;
+}
+
+static bool t3kRafraichir() {
+  const String ref = prefs.getString("t3kRef", "");
+  const String cle = prefs.getString("t3kCle", "");
+  if (!ref.length() || !cle.length()) return false;
+  String rep;
+  const String corps = String("grant_type=refresh_token&refresh_token=") + urlEncode(ref)
+                     + "&client_id=" + urlEncode(cle);
+  const int code = t3kRequete(String(T3K_HOTE) + "/api/v1/oauth/token", corps, "", rep);
+  return (code >= 200 && code < 300) && t3kStockerJetons(rep);
+}
+
+// GET authentifié avec re-tentative après rafraîchissement du jeton
+static int t3kGetAuth(const String &url, String &reponse) {
+  String acc = prefs.getString("t3kAcc", "");
+  if (!acc.length()) return 401;
+  int code = t3kRequete(url, "", acc, reponse);
+  if (code == 401 && t3kRafraichir()) {
+    acc = prefs.getString("t3kAcc", "");
+    code = t3kRequete(url, "", acc, reponse);
+  }
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Page web (embarquée en flash). Le JavaScript contient :
+//  - le MOTEUR NAM (WaveNet + LSTM, conforme à NeuralAmpModelerCore) qui
+//    tourne sur le TÉLÉPHONE pour analyser la capture ;
+//  - le flux OAuth TONE3000 (PKCE, SHA-256 en pur JS : pas de crypto.subtle
+//    sur une page http) — le bouton ouvre le VRAI catalogue tone3000.com.
 // ---------------------------------------------------------------------------
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="fr"><head>
@@ -566,13 +732,21 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;
 background:#e8dcc7;border:3px solid var(--amber2);box-shadow:0 2px 8px #000b}
 .pname{font-size:16px;font-weight:800;color:var(--amber);margin:4px 0 8px;letter-spacing:1px}
 button.b{width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);
-background:#1a1712;color:var(--txt);font-size:13px;font-weight:700;letter-spacing:1px;cursor:pointer}
+background:#1a1712;color:var(--txt);font-size:13px;font-weight:700;letter-spacing:1px;cursor:pointer;margin-top:6px}
 button.b:disabled{opacity:.4}
 button.b.go{background:linear-gradient(#3a2c14,#2c210f);color:var(--amber);border-color:var(--amber2)}
-input[type=file]{width:100%;color:var(--mut);font-size:12px;margin:8px 0}
+input[type=file],input[type=text],input[type=password],select{width:100%;color:var(--txt);
+background:#1a1712;border:1px solid var(--line);border-radius:10px;padding:10px;font-size:13px;margin:6px 0}
+input[type=file]{color:var(--mut);font-size:12px}
 .bar{height:8px;border-radius:4px;background:#3a332a;margin:10px 0 4px;overflow:hidden}
 .bar div{height:100%;width:0%;background:linear-gradient(90deg,var(--amber2),var(--amber));transition:width .2s}
-#msg{font-size:11px;color:var(--mut);min-height:14px}
+.msg{font-size:11px;color:var(--mut);min-height:14px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0 4px}
+.grid button{padding:10px 4px;border-radius:12px;border:1px solid var(--line);
+background:#1a1712;color:var(--mut);font-size:11px;font-weight:700;cursor:pointer}
+.grid button small{display:block;font-size:9px;font-weight:400;margin-top:3px}
+.grid button.sel{background:linear-gradient(#3a2c14,#2c210f);color:var(--amber);
+border-color:var(--amber2);box-shadow:0 0 12px #ff7b1c44}
 .fswrap{display:flex;flex-direction:column;align-items:center;padding:18px 0 14px}
 #fsw{width:96px;height:96px;border-radius:50%;cursor:pointer;border:5px solid #4a4133;
 background:radial-gradient(circle at 35% 30%,#5c5346,#2c2721 70%);
@@ -581,24 +755,43 @@ box-shadow:0 6px 20px #000c,inset 0 2px 6px #fff2;transition:.2s}
 box-shadow:0 0 34px #ff9a2b88,0 6px 20px #000c}
 #fswtxt{margin-top:12px;font-size:13px;letter-spacing:4px;font-weight:800;color:var(--mut)}
 #fsw.on+#fswtxt{color:var(--amber)}
+details{margin-top:8px}
+summary{font-size:11px;color:var(--mut);letter-spacing:2px;cursor:pointer;text-transform:uppercase}
 footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-top:6px}
 </style></head><body>
 <div class="pedal">
 <header>
-  <div><h1>S<b>O</b>AJ</h1><div class="sub">CAPTURE NAM / TONE3000 &middot; 1 ESP32</div></div>
+  <div><h1>S<b>O</b>AJ</h1><div class="sub">TONE3000 INT&Eacute;GR&Eacute; &middot; 1 ESP32</div></div>
   <div class="link"><span id="lktxt">liaison</span><span class="dot" id="dot"></span></div>
 </header>
 
 <div class="card">
-  <div class="row"><label>Capture charg&eacute;e</label></div>
+  <div class="row"><label>P&eacute;dale active</label></div>
   <div class="pname" id="pnom">&mdash;</div>
-  <div class="hint">t&eacute;l&eacute;chargez un fichier .nam sur tone3000.com AVANT de vous connecter
-  &agrave; la p&eacute;dale, puis importez-le ici : le t&eacute;l&eacute;phone ex&eacute;cute le r&eacute;seau NAM,
-  en extrait le profil et l'envoie &agrave; la p&eacute;dale (grav&eacute; en flash).</div>
-  <input type="file" id="fnam" accept=".nam,application/json">
-  <button class="b go" id="analyser" disabled>ANALYSER ET ENVOYER</button>
-  <div class="bar"><div id="prog"></div></div>
-  <div id="msg"></div>
+  <div class="grid" id="slots"></div>
+  <div class="hint">8 emplacements m&eacute;moris&eacute;s dans la p&eacute;dale &mdash; un appui pour changer (fondu, sans Internet)</div>
+</div>
+
+<div class="card">
+  <div class="row"><label>TONE3000</label><span class="msg" id="etatnet"></span></div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <select id="slotsel" style="flex:0 0 110px"></select>
+    <button class="b go" id="t3kgo" style="flex:1;margin-top:0">CHOISIR SUR TONE3000</button>
+  </div>
+  <div class="bar"><div id="tprog"></div></div>
+  <div class="msg" id="tmsg"></div>
+  <details id="conf">
+    <summary>Configuration (1<sup>re</sup> fois)</summary>
+    <div class="hint">1. Sur le t&eacute;l&eacute;phone : activer le PARTAGE DE CONNEXION, puis renseigner :</div>
+    <input type="text" id="hsssid" placeholder="nom du partage de connexion (SSID)">
+    <input type="password" id="hsmdp" placeholder="mot de passe du partage">
+    <button class="b" id="hsok">ENREGISTRER LE R&Eacute;SEAU</button>
+    <div class="hint">2. Cl&eacute; API : tone3000.com &rarr; R&eacute;glages &rarr; API Keys &rarr; cr&eacute;er une cl&eacute;
+    publiable t3k_pub&hellip; (et y autoriser l'adresse de redirection affich&eacute;e ci-dessous)</div>
+    <input type="text" id="t3kcle" placeholder="t3k_pub_...">
+    <button class="b" id="cleok">ENREGISTRER LA CL&Eacute;</button>
+    <div class="hint" id="rediruri"></div>
+  </details>
 </div>
 
 <div class="card">
@@ -620,16 +813,26 @@ footer{text-align:center;font-size:10px;color:#5c5546;letter-spacing:1px;margin-
   <button id="fsw" aria-label="effet"></button>
   <div id="fswtxt">BYPASS</div>
 </div>
-<footer>http://192.168.4.1 &middot; http://soaj-nam.local &mdash; SOAJ NAM ESP32<br>
-page inaccessible ? couper les donn&eacute;es mobiles et rester sur ce WiFi</footer>
+
+<div class="card">
+  <details>
+    <summary>Import manuel d'un fichier .nam (secours)</summary>
+    <div class="hint">marche sans compte TONE3000 : fichier .nam d&eacute;j&agrave; t&eacute;l&eacute;charg&eacute; sur le t&eacute;l&eacute;phone</div>
+    <input type="file" id="fnam" accept=".nam,application/json">
+    <button class="b" id="analyser" disabled>ANALYSER ET ENVOYER</button>
+    <div class="bar"><div id="prog"></div></div>
+    <div class="msg" id="msg"></div>
+  </details>
+</div>
+<footer>http://192.168.4.1 &middot; http://soaj-nam.local &mdash; SOAJ NAM ESP32</footer>
 </div>
 
 <script>
 // ===========================================================================
-// UI : jauges + liaison (m&ecirc;me logique que les autres p&eacute;dales SOAJ)
+// UI : jauges + liaison + slots
 // ===========================================================================
 var KEYS=['g','d','t','v'];
-var st={g:0.5,d:1,t:0.6,v:0.5,e:1};
+var st={g:0.5,d:1,t:0.6,v:0.5,e:1,slot:0,slots:[],sta:0,cle:''};
 var timer=null,lastEdit=0;
 function $(id){return document.getElementById(id)}
 function paint(){
@@ -641,6 +844,27 @@ function paint(){
   $('fsw').className=(st.e==1)?'on':'';
   $('fswtxt').textContent=(st.e==1)?'EFFET ON':'BYPASS';
   if(st.nom)$('pnom').textContent=st.nom;
+  $('etatnet').textContent=st.sta?'en ligne via le téléphone':'hors ligne (partage de connexion ?)';
+  $('etatnet').style.color=st.sta?'#7dd069':'#d05555';
+  $('t3kgo').disabled=!(st.sta&&st.cle);
+  peindreSlots();
+}
+function peindreSlots(){
+  var g=$('slots');g.innerHTML='';
+  var sel=$('slotsel');var selVal=sel.value;sel.innerHTML='';
+  for(var i=0;i<8;i++){
+    var b=document.createElement('button');
+    b.className=(i==st.slot)?'sel':'';
+    b.innerHTML=(i+1)+'<small>'+((st.slots[i]||'&mdash;'))+'</small>';
+    (function(n){b.addEventListener('click',function(){
+      fetch('/api/slot?n='+n).then(function(){poll();});
+    });})(i);
+    g.appendChild(b);
+    var o=document.createElement('option');
+    o.value=i;o.textContent='slot '+(i+1);
+    sel.appendChild(o);
+  }
+  if(selVal!=='')sel.value=selVal;
 }
 function link(ok){
   $('dot').className='dot'+(ok?' on':'');
@@ -666,9 +890,24 @@ function poll(){
   fetch('/api/get').then(function(r){return r.json()}).then(function(j){
     link(true);
     if(Date.now()-lastEdit>2000){st=j;paint();}
+    else{st.slots=j.slots;st.slot=j.slot;st.sta=j.sta;st.cle=j.cle;st.nom=j.nom;peindreSlots();}
   }).catch(function(){link(false)});
 }
 poll();setInterval(poll,3000);
+
+// ===========================================================================
+// Configuration : partage de connexion + clé API
+// ===========================================================================
+$('hsok').addEventListener('click',function(){
+  fetch('/api/hotspot?ssid='+encodeURIComponent($('hsssid').value)
+        +'&mdp='+encodeURIComponent($('hsmdp').value))
+    .then(function(){$('tmsg').textContent='réseau enregistré, connexion en cours (~15 s)...';});
+});
+$('cleok').addEventListener('click',function(){
+  fetch('/api/t3kcle?cle='+encodeURIComponent($('t3kcle').value.trim()))
+    .then(function(){$('tmsg').textContent='clé enregistrée.';poll();});
+});
+$('rediruri').textContent='adresse de redirection à autoriser pour la clé : '+location.origin+'/';
 
 // ===========================================================================
 // MOTEUR NAM : ex&eacute;cute le r&eacute;seau du fichier .nam, &eacute;chantillon par
@@ -792,9 +1031,8 @@ function creerModele(nam){
 }
 
 // ===========================================================================
-// CALIBRATION : mesure la courbe d'&eacute;cr&ecirc;tage (sinus 220 Hz en rampe,
-// cr&ecirc;tes + et − s&eacute;par&eacute;es = asym&eacute;trie) et la r&eacute;ponse lin&eacute;aire
-// (sinus par paliers + Goertzel) -> profil pour l'ESP32.
+// CALIBRATION : courbe d'&eacute;cr&ecirc;tage (sinus 220 Hz en rampe, cr&ecirc;tes
+// + et − s&eacute;par&eacute;es) + r&eacute;ponse lin&eacute;aire (paliers + Goertzel) -> profil.
 // ===========================================================================
 var LUT_T=257,LUT_P=4.0;
 function goertzel(buf,debut,n,f,sr){
@@ -804,7 +1042,6 @@ function goertzel(buf,debut,n,f,sr){
   return Math.sqrt(re*re+im*im);
 }
 function interpDemi(entrees,sorties,u){
-  // interpolation lineaire sur paires triees ; plat au-dela, 0 en-deca
   var n=entrees.length;
   if(n===0)return 0;
   if(u<=entrees[0])return sorties[0]*(u/Math.max(entrees[0],1e-9));
@@ -824,7 +1061,7 @@ function calibrer(modele,nom,progression,fini,erreur){
   var rIn=new Float32Array(nRampe),rOut=new Float32Array(nRampe);
   var sIn=new Float32Array(nParF),sOut=new Float32Array(nParF);
   var dbs=[];
-  var phase=0,idx=0,iF=0;   // phase 0 : prechauffe, 1 : rampe, 2 : sinus
+  var phase=0,idx=0,iF=0;
 
   function pompe(){
     try{
@@ -858,11 +1095,9 @@ function calibrer(modele,nom,progression,fini,erreur){
   }
 
   function terminer(){
-    // --- courbe statique : cretes +/− par periode (robuste au dephasage) ---
     var eP=[],sP=[],eN=[],sN=[],nper=Math.floor(nRampe/per);
     for(var i2=3;i2<nper;i2++){
-      var d=i2*per,f2=d+per,mIn=-9,MIn=9,mo=0,MO=-9,mO=9,j2;
-      var moy=0;
+      var d=i2*per,f2=d+per,j2,moy=0;
       for(j2=d;j2<f2;j2++)moy+=rOut[j2];
       moy/=per;
       var maxI=0,minI=0,maxO=-1e9,minO=1e9;
@@ -888,7 +1123,6 @@ function calibrer(modele,nom,progression,fini,erreur){
     for(var i4=0;i4<LUT_T;i4++)lut[i4]=Math.round(lut[i4]*0.95/crete*1e5)/1e5;
     var sortieGain=Math.min(Math.max(crete/0.95,0.05),1.5);
 
-    // --- reponse lineaire : reference, coins -3 dB, bosse de mediums ---
     var refs=[],i5;
     for(i5=0;i5<nF;i5++)if(freqs[i5]>=400&&freqs[i5]<=1200)refs.push(dbs[i5]);
     if(refs.length===0)refs=dbs.slice();
@@ -915,8 +1149,138 @@ function calibrer(modele,nom,progression,fini,erreur){
   pompe();
 }
 
+// Analyse un objet .nam (déjà parsé) puis grave le profil dans un slot
+function analyserEtEnvoyer(nam,nom,slot,progression,message,fini){
+  var modele=creerModele(nam);
+  if(modele.reste!==0)throw 'fichier .nam invalide ('+modele.reste+' poids inattendus)';
+  message('analyse du reseau ('+nam.architecture+', '+nam.weights.length+' poids)...');
+  calibrer(modele,nom,progression,function(profil){
+    message('envoi du profil a la pedale...');
+    fetch('/api/profil?slot='+slot,{method:'POST',body:JSON.stringify(profil)})
+      .then(function(r){if(!r.ok)throw 'HTTP '+r.status;return r.json();})
+      .then(function(j){progression(100);fini(j.nom);poll();})
+      .catch(function(e){message('echec envoi : '+e);});
+  },function(e){message('echec analyse : '+e);});
+}
+
 // ===========================================================================
-// Import : lecture du .nam -> moteur -> calibration -> POST /api/profil
+// TONE3000 : PKCE + flux « select » — le bouton ouvre le VRAI catalogue.
+// SHA-256 en pur JavaScript : crypto.subtle n'existe pas sur une page http.
+// ===========================================================================
+function sha256Octets(txt){
+  var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+         0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+         0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+         0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+         0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+         0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+         0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+         0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  var H=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var oct=[];
+  for(var i=0;i<txt.length;i++)oct.push(txt.charCodeAt(i)&0xff);
+  var bits=oct.length*8;
+  oct.push(0x80);
+  while(oct.length%64!==56)oct.push(0);
+  for(i=7;i>=0;i--)oct.push((i>=4)?0:((bits>>>(i*8))&0xff));
+  function rr(x,n){return (x>>>n)|(x<<(32-n));}
+  var w=new Array(64);
+  for(var b0=0;b0<oct.length;b0+=64){
+    for(i=0;i<16;i++)w[i]=(oct[b0+4*i]<<24)|(oct[b0+4*i+1]<<16)|(oct[b0+4*i+2]<<8)|oct[b0+4*i+3];
+    for(i=16;i<64;i++){
+      var s0=rr(w[i-15],7)^rr(w[i-15],18)^(w[i-15]>>>3);
+      var s1=rr(w[i-2],17)^rr(w[i-2],19)^(w[i-2]>>>10);
+      w[i]=(w[i-16]+s0+w[i-7]+s1)|0;
+    }
+    var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for(i=0;i<64;i++){
+      var S1=rr(e,6)^rr(e,11)^rr(e,25);
+      var ch=(e&f)^(~e&g);
+      var t1=(h+S1+ch+K[i]+w[i])|0;
+      var S0=rr(a,2)^rr(a,13)^rr(a,22);
+      var mj=(a&b)^(a&c)^(b&c);
+      var t2=(S0+mj)|0;
+      h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;
+    }
+    H[0]=(H[0]+a)|0;H[1]=(H[1]+b)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;
+    H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0;
+  }
+  var out=new Uint8Array(32);
+  for(i=0;i<8;i++){out[4*i]=(H[i]>>>24)&255;out[4*i+1]=(H[i]>>>16)&255;
+                   out[4*i+2]=(H[i]>>>8)&255;out[4*i+3]=H[i]&255;}
+  return out;
+}
+function b64url(octets){
+  var s='';
+  for(var i=0;i<octets.length;i++)s+=String.fromCharCode(octets[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function tmsg(t){$('tmsg').textContent=t;}
+function tprog(p){$('tprog').style.width=p+'%';}
+
+var T3K='https://www.tone3000.com';
+$('t3kgo').addEventListener('click',function(){
+  var v=b64url(crypto.getRandomValues(new Uint8Array(32)));
+  var s=b64url(crypto.getRandomValues(new Uint8Array(16)));
+  localStorage.setItem('t3k_v',v);
+  localStorage.setItem('t3k_s',s);
+  localStorage.setItem('t3k_slot',$('slotsel').value||'0');
+  var r=location.origin+'/';
+  location.href=T3K+'/api/v1/oauth/authorize?client_id='+encodeURIComponent(st.cle)
+    +'&redirect_uri='+encodeURIComponent(r)+'&response_type=code'
+    +'&code_challenge='+b64url(sha256Octets(v))+'&code_challenge_method=S256'
+    +'&state='+s+'&prompt=select_tone&format=nam';
+});
+
+// Retour du catalogue : ?code=...&state=...&tone_id=...
+function t3kRetour(){
+  var q=new URLSearchParams(location.search);
+  if(!q.get('code')&&!q.get('error'))return;
+  var v=localStorage.getItem('t3k_v'),s=localStorage.getItem('t3k_s');
+  var slot=+(localStorage.getItem('t3k_slot')||'0');
+  var toneId=q.get('tone_id');
+  var code=q.get('code'),etat=q.get('state'),err=q.get('error');
+  history.replaceState(null,'','/');
+  if(err){tmsg('refuse par TONE3000 : '+err);return;}
+  if(etat!==s){tmsg('etat PKCE invalide, reessayez');return;}
+  tmsg('echange du code aupres de la pedale...');tprog(2);
+  fetch('/t3k/token?code='+encodeURIComponent(code)+'&verifier='+encodeURIComponent(v)
+        +'&redirect='+encodeURIComponent(location.origin+'/'),{method:'POST'})
+  .then(function(r){return r.json();})
+  .then(function(j){
+    if(!j.ok)throw (j.erreur||'echec du jeton');
+    if(!toneId)throw 'aucune pedale selectionnee';
+    tmsg('liste des modeles...');tprog(5);
+    return fetch('/t3k/modeles?tone_id='+encodeURIComponent(toneId));
+  })
+  .then(function(r){return r.json();})
+  .then(function(j){
+    var liste=j.data||[];
+    if(!liste.length)throw 'aucun modele pour cette pedale';
+    var m=liste[0];
+    for(var i=0;i<liste.length;i++)
+      if((liste[i].size||'')==='standard'){m=liste[i];break;}
+    tmsg('la pedale telecharge "'+m.name+'"...');tprog(8);
+    return fetch('/t3k/telecharger?url='+encodeURIComponent(m.model_url),{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(t){
+        if(!t.ok)throw (t.erreur||'echec du telechargement');
+        tmsg('lecture de la capture ('+Math.round(t.taille/1024)+' Ko)...');tprog(10);
+        return fetch('/t3k/fichier').then(function(r){return r.json();})
+          .then(function(nam){
+            var nom=(nam.metadata&&nam.metadata.name)?nam.metadata.name:m.name;
+            analyserEtEnvoyer(nam,nom,slot,
+              function(p){tprog(10+Math.floor(p*0.9));},tmsg,
+              function(n){tmsg('"'+n+'" grave dans le slot '+(slot+1)+' — pret a jouer !');});
+          });
+      });
+  })
+  .catch(function(e){tmsg('echec : '+e);tprog(0);});
+}
+t3kRetour();
+
+// ===========================================================================
+// Import manuel (secours) : fichier .nam local -> analyse -> slot choisi
 // ===========================================================================
 var fichierNam=null;
 $('fnam').addEventListener('change',function(){
@@ -930,26 +1294,13 @@ $('analyser').addEventListener('click',function(){
   $('msg').textContent='lecture du fichier...';
   fichierNam.text().then(function(txt){
     var nam=JSON.parse(txt);
-    var modele=creerModele(nam);
-    if(modele.reste!==0)throw 'fichier .nam invalide ('+modele.reste+' poids inattendus)';
     var nom=(nam.metadata&&nam.metadata.name)?nam.metadata.name
             :fichierNam.name.replace(/\.nam$/i,'');
-    $('msg').textContent='analyse du reseau ('+nam.architecture+', '
-                         +nam.weights.length+' poids)...';
-    calibrer(modele,nom,
-      function(pct){$('prog').style.width=pct+'%';},
-      function(profil){
-        $('msg').textContent='envoi du profil a la pedale...';
-        fetch('/api/profil',{method:'POST',body:JSON.stringify(profil)})
-          .then(function(r){if(!r.ok)throw 'HTTP '+r.status;return r.json();})
-          .then(function(j){
-            $('prog').style.width='100%';
-            $('msg').textContent='profil "'+j.nom+'" charge et grave en flash.';
-            st.nom=j.nom;paint();btn.disabled=false;
-          })
-          .catch(function(e){$('msg').textContent='echec envoi : '+e;btn.disabled=false;});
-      },
-      function(e){$('msg').textContent='echec analyse : '+e;btn.disabled=false;});
+    var slot=+($('slotsel').value||'0');
+    analyserEtEnvoyer(nam,nom,slot,
+      function(p){$('prog').style.width=p+'%';},
+      function(t){$('msg').textContent=t;},
+      function(n){$('msg').textContent='"'+n+'" grave dans le slot '+(slot+1)+'.';btn.disabled=false;});
   }).catch(function(e){$('msg').textContent='fichier illisible : '+e;btn.disabled=false;});
 });
 </script>
@@ -964,12 +1315,20 @@ static void handleRoot() {
 }
 
 static void handleApiGet() {
-  char buf[160];
-  snprintf(buf, sizeof(buf),
-           "{\"g\":%.2f,\"d\":%.2f,\"t\":%.2f,\"v\":%.2f,\"e\":%d,\"nom\":\"%s\"}",
-           (double)tgtDrive, (double)tgtMix, (double)tgtTone, (double)tgtVolume,
-           (tgtEffect > 0.5f) ? 1 : 0, profilActif.nom);
-  server.send(200, "application/json", buf);
+  String rep = "{\"g\":" + String(tgtDrive, 2) + ",\"d\":" + String(tgtMix, 2)
+             + ",\"t\":" + String(tgtTone, 2) + ",\"v\":" + String(tgtVolume, 2)
+             + ",\"e\":" + String((tgtEffect > 0.5f) ? 1 : 0)
+             + ",\"nom\":\"" + profilActif.nom + "\""
+             + ",\"slot\":" + String((int)slotActif)
+             + ",\"sta\":" + String((WiFi.status() == WL_CONNECTED) ? 1 : 0)
+             + ",\"cle\":\"" + prefs.getString("t3kCle", "") + "\",\"slots\":[";
+  for (int n = 0; n < NB_SLOTS; n++) {
+    rep += "\"";
+    rep += nomsSlots[n];
+    rep += (n < NB_SLOTS - 1) ? "\"," : "\"";
+  }
+  rep += "]}";
+  server.send(200, "application/json", rep);
 }
 
 static void handleApiSet() {
@@ -981,42 +1340,183 @@ static void handleApiSet() {
   handleApiGet();
 }
 
-// POST /api/profil : profil extrait du .nam par le téléphone
+// POST /api/profil?slot=n : profil analysé par le téléphone -> slot NVS + actif
 static void handleApiProfil() {
+  int n = server.hasArg("slot") ? server.arg("slot").toInt() : (int)slotActif;
+  if (n < 0) n = 0;
+  if (n >= NB_SLOTS) n = NB_SLOTS - 1;
   const String &corps = server.arg("plain");
   ProfilNam p;
   if (!parseProfilJson(corps.c_str(), &p)) {
     server.send(400, "application/json", "{\"erreur\":\"profil invalide\"}");
     return;
   }
+  sauverSlotNVS(n, &p);                // écriture flash : bref craquement possible
+  slotActif = (uint8_t)n;
+  prefs.putUChar("slotActif", slotActif);
   memcpy(&profilRecu, &p, sizeof(p));
   profilEnAttente = true;              // la tâche audio l'échange en fondu
-  sauverProfilNVS(&p);                 // survivra à l'extinction (écriture
-                                       // flash : bref craquement possible)
-  Serial.printf("[Profil] \"%s\" reçu : HPF %.0f Hz, LPF %.0f Hz, "
-                "mid %+.1f dB @ %.0f Hz, sortie x%.2f\n",
-                p.nom, p.preHpfHz, p.preLpfHz, p.postMidDb, p.postMidHz,
-                p.sortieGain);
-  char buf[64];
-  snprintf(buf, sizeof(buf), "{\"nom\":\"%s\"}", p.nom);
-  server.send(200, "application/json", buf);
+  Serial.printf("[Profil] \"%s\" grave dans le slot %d et active\n", p.nom, n + 1);
+  server.send(200, "application/json", String("{\"nom\":\"") + p.nom + "\"}");
 }
 
-// Toute URL inconnue redirige vers la page (portail captif). "no-store" :
-// certains téléphones mettent en cache la réponse de leur sonde de
-// connectivité et ne re-testent plus — on l'interdit.
+// GET /api/slot?n= : activer un profil mémorisé (fondu anti-clic)
+static void handleApiSlot() {
+  const int n = server.arg("n").toInt();
+  ProfilNam p;
+  if (n < 0 || n >= NB_SLOTS || !chargerSlotNVS(n, &p)) {
+    server.send(404, "application/json", "{\"erreur\":\"slot vide\"}");
+    return;
+  }
+  slotActif = (uint8_t)n;
+  prefs.putUChar("slotActif", slotActif);
+  memcpy(&profilRecu, &p, sizeof(p));
+  profilEnAttente = true;
+  Serial.printf("[Profil] slot %d (\"%s\") active\n", n + 1, p.nom);
+  server.send(200, "application/json", String("{\"nom\":\"") + p.nom + "\"}");
+}
+
+// GET /api/hotspot?ssid=&mdp= : identifiants du partage de connexion
+static void handleApiHotspot() {
+  strncpy(hsSsid, server.arg("ssid").c_str(), sizeof(hsSsid) - 1);
+  strncpy(hsMdp,  server.arg("mdp").c_str(),  sizeof(hsMdp) - 1);
+  hsSsid[sizeof(hsSsid) - 1] = '\0';
+  hsMdp[sizeof(hsMdp) - 1]   = '\0';
+  prefs.putString("hsSsid", hsSsid);
+  prefs.putString("hsMdp", hsMdp);
+  if (hsSsid[0]) {
+    Serial.printf("[WiFi] Connexion au partage \"%s\"...\n", hsSsid);
+    WiFi.begin(hsSsid, hsMdp);
+  }
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// GET /api/t3kcle?cle= : clé API publiable TONE3000
+static void handleApiT3kCle() {
+  prefs.putString("t3kCle", server.arg("cle"));
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// POST /t3k/token?code=&verifier=&redirect= : échange OAuth (PKCE) — les
+// jetons restent dans la pédale
+static void handleT3kToken() {
+  const String cle = prefs.getString("t3kCle", "");
+  if (!cle.length()) {
+    server.send(400, "application/json", "{\"ok\":0,\"erreur\":\"cle API absente\"}");
+    return;
+  }
+  const String corps = String("grant_type=authorization_code")
+                     + "&code=" + urlEncode(server.arg("code"))
+                     + "&code_verifier=" + urlEncode(server.arg("verifier"))
+                     + "&redirect_uri=" + urlEncode(server.arg("redirect"))
+                     + "&client_id=" + urlEncode(cle);
+  String rep;
+  const int code = t3kRequete(String(T3K_HOTE) + "/api/v1/oauth/token", corps, "", rep);
+  if (code < 200 || code >= 300 || !t3kStockerJetons(rep)) {
+    Serial.printf("[T3K] Echec echange jeton (HTTP %d)\n", code);
+    server.send(502, "application/json",
+                String("{\"ok\":0,\"erreur\":\"HTTP ") + code + "\"}");
+    return;
+  }
+  Serial.println("[T3K] Compte TONE3000 connecte (jetons en flash)");
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// GET /t3k/modeles?tone_id= : relaie la liste des modèles d'une pédale
+static void handleT3kModeles() {
+  String rep;
+  const String url = String(T3K_HOTE) + "/api/v1/models?tone_id="
+                   + urlEncode(server.arg("tone_id"));
+  const int code = t3kGetAuth(url, rep);
+  if (code < 200 || code >= 300) {
+    server.send(502, "application/json",
+                String("{\"erreur\":\"HTTP ") + code + "\"}");
+    return;
+  }
+  server.send(200, "application/json", rep);
+}
+
+// POST /t3k/telecharger?url= : télécharge la capture .nam dans LittleFS
+static void handleT3kTelecharger() {
+  const String url = server.arg("url");
+  if (!url.startsWith(String(T3K_HOTE) + "/")) {   // uniquement tone3000.com
+    server.send(400, "application/json", "{\"ok\":0,\"erreur\":\"url refusee\"}");
+    return;
+  }
+  String acc = prefs.getString("t3kAcc", "");
+  if (!acc.length()) {
+    server.send(401, "application/json", "{\"ok\":0,\"erreur\":\"pas de jeton\"}");
+    return;
+  }
+
+  WiFiClientSecure tls;
+#if T3K_TLS_STRICT
+  tls.setCACert(ISRG_ROOT_X1);
+#else
+  tls.setInsecure();
+#endif
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(30000);
+  if (!http.begin(tls, url)) {
+    server.send(502, "application/json", "{\"ok\":0,\"erreur\":\"connexion\"}");
+    return;
+  }
+  http.addHeader("Authorization", String("Bearer ") + acc);
+  int code = http.GET();
+  if (code == 401) {                    // jeton expiré -> rafraîchir et retenter
+    http.end();
+    if (t3kRafraichir()) {
+      acc = prefs.getString("t3kAcc", "");
+      http.begin(tls, url);
+      http.addHeader("Authorization", String("Bearer ") + acc);
+      code = http.GET();
+    }
+  }
+  if (code < 200 || code >= 300) {
+    http.end();
+    Serial.printf("[T3K] Echec telechargement (HTTP %d)\n", code);
+    server.send(502, "application/json",
+                String("{\"ok\":0,\"erreur\":\"HTTP ") + code + "\"}");
+    return;
+  }
+
+  LittleFS.remove(FICHIER_NAM);
+  File f = LittleFS.open(FICHIER_NAM, "w");
+  if (!f) {
+    http.end();
+    server.send(500, "application/json", "{\"ok\":0,\"erreur\":\"flash pleine\"}");
+    return;
+  }
+  http.writeToStream(&f);
+  const size_t taille = f.size();
+  f.close();
+  http.end();
+  Serial.printf("[T3K] Capture telechargee : %u octets\n", (unsigned)taille);
+  server.send(200, "application/json",
+              String("{\"ok\":1,\"taille\":") + taille + "}");
+}
+
+// GET /t3k/fichier : sert la capture téléchargée à la page (même origine)
+static void handleT3kFichier() {
+  File f = LittleFS.open(FICHIER_NAM, "r");
+  if (!f) {
+    server.send(404, "application/json", "{\"erreur\":\"aucune capture\"}");
+    return;
+  }
+  server.streamFile(f, "application/json");
+  f.close();
+}
+
+// Toute URL inconnue redirige vers la page (portail captif pour le mode AP)
 static void handleNotFound() {
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
   server.sendHeader("Cache-Control", "no-store");
   server.send(302, "text/plain", "");
 }
 
-// Sondes de détection de portail captif : à la connexion, chaque OS teste
-// une URL précise pour savoir s'il y a Internet. On répond NOUS-MÊMES une
-// redirection vers la page : le téléphone ouvre alors sa fenêtre
-// « connexion au réseau » — AUCUN accès Internet n'est nécessaire.
-// (onNotFound les couvrirait déjà ; les déclarer rend l'intention explicite
-// et garantit le comportement.)
+// Sondes de détection de portail captif (utiles quand le téléphone est
+// connecté au point d'accès SOAJ-NAM plutôt qu'au partage de connexion)
 static void routesPortailCaptif() {
   const char *sondes[] = {
     "/generate_204", "/gen_204",                      // Android
@@ -1029,7 +1529,7 @@ static void routesPortailCaptif() {
 }
 
 // ---------------------------------------------------------------------------
-// Tâches : audio serré sur le cœur 1, web/DNS sur le cœur 0
+// Tâches : audio serré sur le cœur 1, web/DNS/WiFi sur le cœur 0
 // ---------------------------------------------------------------------------
 #define SD_STEP_US 25
 
@@ -1053,9 +1553,27 @@ static void tacheAudio(void *arg) {
 
 static void tacheWeb(void *arg) {
   (void)arg;
+  uint32_t staDernierEssai = 0;
+  bool     staAnnonce      = false;
   for (;;) {
     dnsServer.processNextRequest();
     server.handleClient();
+
+    // Reconnexion au partage de connexion (toutes les 15 s tant que perdu)
+    if (hsSsid[0]) {
+      const bool ok = (WiFi.status() == WL_CONNECTED);
+      if (ok && !staAnnonce) {
+        Serial.print("[WiFi] Relie au partage de connexion — IP : ");
+        Serial.println(WiFi.localIP());
+        staAnnonce = true;
+      } else if (!ok) {
+        staAnnonce = false;
+        if (millis() - staDernierEssai > 15000) {
+          staDernierEssai = millis();
+          WiFi.begin(hsSsid, hsMdp);
+        }
+      }
+    }
     delay(2);                          // laisse respirer la pile WiFi
   }
 }
@@ -1066,7 +1584,7 @@ static void tacheWeb(void *arg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== SOAJ NAM — 1 ESP32, captures TONE3000 via le téléphone ===");
+  Serial.println("\n=== SOAJ NAM — 1 ESP32, catalogue TONE3000 integre ===");
 
   // --- ADC / DAC ---
 #ifdef USE_LEGACY_ADC
@@ -1078,13 +1596,28 @@ void setup() {
 #endif
   dacWrite(PIN_AUDIO_OUT, 128);
 
-  // --- Profil : depuis la flash, sinon neutre ---
+  // --- Flash : NVS (profils, réglages) + LittleFS (capture téléchargée) ---
   prefs.begin("soajnam", false);
-  if (chargerProfilNVS(&profilActif)) {
-    Serial.printf("[Profil] restauré depuis la flash : \"%s\"\n", profilActif.nom);
+  if (!LittleFS.begin(true)) Serial.println("[Flash] LittleFS indisponible !");
+
+  // Migration depuis l'ancienne version (un seul profil sous "profil")
+  if (prefs.getBytesLength("profil") == sizeof(ProfilNam)
+      && prefs.getBytesLength("prof0") != sizeof(ProfilNam)) {
+    ProfilNam ancien;
+    prefs.getBytes("profil", &ancien, sizeof(ancien));
+    bornerProfil(&ancien);
+    sauverSlotNVS(0, &ancien);
+    Serial.println("[Profil] ancien profil migre vers le slot 1");
+  }
+
+  chargerNomsSlots();
+  slotActif = prefs.getUChar("slotActif", 0);
+  if (slotActif >= NB_SLOTS) slotActif = 0;
+  if (chargerSlotNVS(slotActif, &profilActif)) {
+    Serial.printf("[Profil] slot %d restaure : \"%s\"\n", slotActif + 1, profilActif.nom);
   } else {
     profilNeutre(&profilActif);
-    Serial.println("[Profil] aucun en flash : profil NEUTRE (tanh) chargé");
+    Serial.println("[Profil] slot vide : profil NEUTRE (tanh) charge");
   }
   chargerFiltresProfil();
   driveGain = profilActif.gainMin
@@ -1098,35 +1631,46 @@ void setup() {
     envHpA = rc / (rc + DT_SEC);
   }
 
-  // --- WiFi : point d'accès + portail captif + serveur ---
-  WiFi.mode(WIFI_AP);
+  // --- WiFi : point d'accès (config/secours) + station (partage de connexion) ---
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASSWORD, WIFI_CHANNEL);
-  Serial.printf("[WiFi] Point d'accès \"%s\" (mdp \"%s\") — http://", AP_SSID, AP_PASSWORD);
+  Serial.printf("[WiFi] Point d'acces \"%s\" (mdp \"%s\") — http://", AP_SSID, AP_PASSWORD);
   Serial.println(WiFi.softAPIP());
 
-  // DNS captif : TOUTE résolution renvoie l'IP de la pédale, y compris les
-  // requêtes malformées (NoError + TTL court : certains téléphones gardent
-  // sinon un échec en cache et concluent « pas d'Internet, pas de portail »)
+  prefs.getString("hsSsid", hsSsid, sizeof(hsSsid));
+  prefs.getString("hsMdp",  hsMdp,  sizeof(hsMdp));
+  if (hsSsid[0]) {
+    Serial.printf("[WiFi] Connexion au partage \"%s\"...\n", hsSsid);
+    WiFi.begin(hsSsid, hsMdp);
+  } else {
+    Serial.println("[WiFi] Aucun partage memorise : le renseigner sur la page (Configuration)");
+  }
+
+  // DNS captif (mode AP) : toute résolution renvoie l'IP de la pédale
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.setTTL(30);
   dnsServer.start(53, "*", WiFi.softAPIP());
 
-  // mDNS : accès de secours SANS DNS captif ni Internet — http://soaj-nam.local
-  // (utile si le téléphone route les IP inconnues vers la 4G/5G)
+  // mDNS : http://soaj-nam.local sur le partage de connexion ET sur l'AP
   if (MDNS.begin("soaj-nam")) MDNS.addService("http", "tcp", 80);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/get", HTTP_GET, handleApiGet);
   server.on("/api/set", HTTP_GET, handleApiSet);
   server.on("/api/profil", HTTP_POST, handleApiProfil);
-  routesPortailCaptif();                 // sondes Android/iOS/Windows/Firefox
+  server.on("/api/slot", HTTP_GET, handleApiSlot);
+  server.on("/api/hotspot", HTTP_GET, handleApiHotspot);
+  server.on("/api/t3kcle", HTTP_GET, handleApiT3kCle);
+  server.on("/t3k/token", HTTP_POST, handleT3kToken);
+  server.on("/t3k/modeles", HTTP_GET, handleT3kModeles);
+  server.on("/t3k/telecharger", HTTP_POST, handleT3kTelecharger);
+  server.on("/t3k/fichier", HTTP_GET, handleT3kFichier);
+  routesPortailCaptif();
   server.onNotFound(handleNotFound);
   server.begin();
 
-  Serial.println("[Web] Si la page ne s'ouvre pas toute seule :");
-  Serial.println("      1. COUPER les données mobiles (4G/5G) le temps du réglage");
-  Serial.println("      2. Rester connecté au WiFi même si « pas d'Internet »");
-  Serial.println("      3. Taper http://192.168.4.1 (avec http:// !) ou http://soaj-nam.local");
+  Serial.println("[Web] Page : http://soaj-nam.local (partage de connexion)");
+  Serial.println("      ou http://192.168.4.1 (WiFi SOAJ-NAM, donnees mobiles COUPEES)");
 
   // --- Stabilisation de l'offset DC avant de sortir du son ---
   for (int i = 0; i < 4000; i++) {
@@ -1134,15 +1678,15 @@ void setup() {
     dcOffset += 0.01f * ((float)raw - dcOffset);
     delayMicroseconds(50);
   }
-  Serial.printf("Offset DC mesuré : %.0f (attendu ~2048)\n", dcOffset);
+  Serial.printf("Offset DC mesure : %.0f (attendu ~2048)\n", dcOffset);
   if (dcOffset < 1200.0f || dcOffset > 2900.0f) {
-    Serial.println("ATTENTION : offset DC anormal — vérifiez le pont diviseur");
+    Serial.println("ATTENTION : offset DC anormal — verifiez le pont diviseur");
   }
 
   // --- Tâches : audio (cœur 1, boucle serrée), web (cœur 0) ---
   disableCore1WDT();       // la boucle audio ne rend jamais la main
   xTaskCreatePinnedToCore(tacheAudio, "audio", 8192, NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(tacheWeb,   "web",   8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(tacheWeb,   "web",  12288, NULL, 1, NULL, 0);
 
   Serial.printf("Audio : %d Hz — drive -> filtres du profil -> courbe NAM -> tone -> volume\n",
                 SAMPLE_RATE_HZ);

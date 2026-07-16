@@ -1,3 +1,8 @@
+> **✅ Mis en œuvre** dans `PedaleNam.ino` avec un ajustement : l'analyse de la
+> capture reste faite par le **téléphone** (moteur NAM JavaScript déjà validé,
+> quelques secondes au lieu de ~1-3 min sur ESP32) — l'ESP32 s'occupe de
+> l'OAuth, du téléchargement, des 8 slots et de l'audio. Voir le README.
+
 # SOAJ NAM — Conception « PLUG AND PLAY » : l'ESP32 télécharge tout seul depuis TONE3000
 
 > Schéma de pensée global. L'idée : **le partage de connexion du téléphone**
