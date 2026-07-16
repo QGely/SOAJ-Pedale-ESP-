@@ -380,6 +380,28 @@ L'astuce : **c'est le téléphone qui l'exécute**, pas l'ESP32.
 API : `GET /api/get`, `GET /api/set?g=&d=&t=&v=&e=`,
 `POST /api/profil` (JSON du profil — c'est ce qu'envoie la page).
 
+### La page ne s'ouvre pas ? (« ce réseau n'a pas d'accès Internet »)
+
+C'est le téléphone qui bloque, pas la pédale — **aucune connexion Internet
+n'est nécessaire**, il faut juste l'empêcher de contourner le WiFi local :
+
+1. **Couper les données mobiles (4G/5G)** le temps du réglage : sinon le
+   téléphone envoie les requêtes par le réseau mobile et `192.168.4.1`
+   n'aboutit jamais.
+2. À l'avertissement « ce réseau n'a pas d'accès Internet », répondre
+   **« Rester connecté »** (Android) ou **« Utiliser sans Internet »** (iOS).
+3. Si la fenêtre ne s'ouvre pas toute seule, taper **`http://192.168.4.1`**
+   dans le navigateur — **avec le préfixe `http://`** : tapé nu, Chrome force
+   le HTTPS et affiche « pas de connexion ». `http://soaj-nam.local` marche
+   aussi (mDNS, pratique sur iPhone et PC).
+4. Pour l'import du `.nam`, préférez un vrai navigateur (Safari/Chrome) à la
+   petite fenêtre de connexion du portail : ouvrez `http://192.168.4.1`
+   à la main.
+
+Le croquis répond de lui-même aux sondes de détection de portail
+d'Android, iOS, Windows et Firefox : sur la plupart des téléphones la
+fenêtre s'ouvre seule une fois les données mobiles coupées.
+
 ### Limites honnêtes
 
 Le profil garde le **caractère statique** de la capture (courbe de saturation,
