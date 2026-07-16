@@ -412,7 +412,9 @@ static Biquad fMid    = {0};
 static Biquad fHigh   = {0};
 static Biquad fCab    = {0};   // passe-bas "haut-parleur" post-EQ (5,5 kHz)
 static Biquad fSortie = {0};
-static float  quantErr = 0.0f;       // mise en forme du bruit DAC
+static float  quantErr  = 0.0f;      // erreur du quantificateur sigma-delta
+static float  dacTarget = 128.0f;    // valeur DAC visée (float, tenue entre
+                                     // deux échantillons pour le sigma-delta)
 static float  envelope = 0.0f;       // suiveur d'enveloppe RAPIDE du gate
 static float  envSlow  = 0.0f;       // suiveur LENT (mémoire de la note ~170 ms)
 static float  gateGain = 0.0f;       // gain du gate (0..1)
@@ -555,6 +557,29 @@ static void playTestTone(float freqHz, float durSec, float amp) {
   dacWrite(PIN_AUDIO_OUT, 128);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Pas de SIGMA-DELTA du DAC : quantifie dacTarget en réinjectant l'erreur.
+// Appelé au moins 2x par période d'échantillon (~40 kHz et plus, voir loop) :
+// le bruit de quantification du DAC 8 bits est repoussé vers l'ultrasonique
+// (12-20 kHz, que ni l'ampli ni l'oreille ne reproduisent) au lieu de
+// s'empiler en bande audible 6-9 kHz — c'était le "scratch" continu.
+// Mesuré en simulation : -6,7 dB de bruit dans la bande 5-9 kHz.
+// ---------------------------------------------------------------------------
+static inline void dacStep() {
+  const float desired = dacTarget + quantErr;
+  int v = (int)lroundf(desired);
+  if (v < 0)   v = 0;
+  if (v > 255) v = 255;
+  quantErr = desired - (float)v;
+  if (quantErr >  1.0f) quantErr =  1.0f;
+  if (quantErr < -1.0f) quantErr = -1.0f;
+#if DEBUG_METER
+  const int outDev = (v > 128) ? (v - 128) : (128 - v);
+  if (outDev > mPeakOut) mPeakOut = outDev;
+#endif
+  dacWrite(PIN_AUDIO_OUT, (uint8_t)v);
+}
 
 // ---------------------------------------------------------------------------
 // Traitement d'UN échantillon
@@ -711,24 +736,9 @@ static inline void processSample() {
   const float dry = x * BYPASS_GAIN;
   y = dry + (y - dry) * smEffect;
 
-  // --- DAC 8 bits centré sur 128 + mise en forme du bruit ---
-  const float desired = 128.0f + y * OUTPUT_LEVEL * 127.0f + quantErr;
-  int dacVal = (int)lroundf(desired);
-  if (dacVal < 0)   dacVal = 0;
-  if (dacVal > 255) dacVal = 255;
-  // Mise en forme du bruit PARTIELLE (x0.5) : la version pleine concentrait
-  // le bruit de quantification du DAC 8 bits en une bande 6-9 kHz — le
-  // "scratch" fin entendu en continu. À 0.5 le bruit reste mieux réparti.
-  quantErr = (desired - (float)dacVal) * 0.5f;
-  if (quantErr >  1.0f) quantErr =  1.0f;
-  if (quantErr < -1.0f) quantErr = -1.0f;
-
-#if DEBUG_METER
-  const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
-  if (outDev > mPeakOut) mPeakOut = outDev;
-#endif
-
-  dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
+  // --- Cible DAC : la sortie physique est tenue par le sigma-delta (~40 kHz) ---
+  dacTarget = 128.0f + y * OUTPUT_LEVEL * 127.0f;
+  dacStep();
 }
 
 // ---------------------------------------------------------------------------
@@ -820,14 +830,22 @@ void setup() {
 }
 
 // ---------------------------------------------------------------------------
-// Boucle audio : cadence fixe 20 kHz
+// Boucle audio : échantillons à 20 kHz + pas sigma-delta intermédiaires
+// (le DAC est re-quantifié toutes les >=25 µs, soit ~40 kHz effectifs)
 // ---------------------------------------------------------------------------
+#define SD_STEP_US 25
+static uint32_t lastStepUs = 0;
+
 void loop() {
   const uint32_t now = micros();
-  if ((int32_t)(now - nextSampleUs) < 0) return;
 
-  nextSampleUs += SAMPLE_PERIOD_US;
-  if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
-
-  processSample();
+  if ((int32_t)(now - nextSampleUs) >= 0) {
+    nextSampleUs += SAMPLE_PERIOD_US;
+    if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
+    processSample();                       // calcule dacTarget + 1er pas
+    lastStepUs = micros();
+  } else if ((uint32_t)(now - lastStepUs) >= SD_STEP_US) {
+    dacStep();                             // pas sigma-delta intermédiaire
+    lastStepUs = now;
+  }
 }

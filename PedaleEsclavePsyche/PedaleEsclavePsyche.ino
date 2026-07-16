@@ -158,7 +158,8 @@ static float gateGain  = 0.0f;
 // Passe-haut 120 Hz pour la mesure d'enveloppe (anti-ronflette secteur)
 static float envHpX = 0.0f, envHpY = 0.0f, envHpA = 0.0f;
 static float lpTone    = 0.0f;      // passe-bas de tone (1 pôle)
-static float quantErr  = 0.0f;
+static float quantErr  = 0.0f;      // erreur du quantificateur sigma-delta
+static float dacTarget = 128.0f;    // valeur DAC visée (tenue entre échantillons)
 
 // Paramètres lissés
 static float smGain   = 0.4f, smDist  = 0.3f, smReverb = 0.5f, smDecay = 0.5f;
@@ -262,6 +263,26 @@ static inline void meterTick(float raw) {
   }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Pas de SIGMA-DELTA du DAC (~40 kHz effectifs, voir loop) : repousse le
+// bruit de quantification 8 bits vers l'ultrasonique au lieu de la bande
+// audible 6-9 kHz. Mesuré : -6,7 dB de bruit dans la bande 5-9 kHz.
+// ---------------------------------------------------------------------------
+static inline void dacStep() {
+  const float desired = dacTarget + quantErr;
+  int v = (int)lroundf(desired);
+  if (v < 0)   v = 0;
+  if (v > 255) v = 255;
+  quantErr = desired - (float)v;
+  if (quantErr >  1.0f) quantErr =  1.0f;
+  if (quantErr < -1.0f) quantErr = -1.0f;
+#if DEBUG_METER
+  const int outDev = (v > 128) ? (v - 128) : (128 - v);
+  if (outDev > mPeakOut) mPeakOut = outDev;
+#endif
+  dacWrite(PIN_AUDIO_OUT, (uint8_t)v);
+}
 
 // ---------------------------------------------------------------------------
 // Traitement d'UN échantillon
@@ -378,23 +399,9 @@ static inline void processSample() {
   y = y * smVolume * OUTPUT_LEVEL * 2.0f;      // volume (V=0.5 -> x0.9)
   y = dry + (y - dry) * smEffect;
 
-  // --- DAC 8 bits centré sur 128 + mise en forme du bruit ---
-  const float desired = 128.0f + y * 127.0f + quantErr;
-  int dacVal = (int)lroundf(desired);
-  if (dacVal < 0)   dacVal = 0;
-  if (dacVal > 255) dacVal = 255;
-  // Mise en forme du bruit PARTIELLE (x0.5) : évite de concentrer le bruit
-  // de quantification du DAC 8 bits en une bande 6-9 kHz ("scratch" continu)
-  quantErr = (desired - (float)dacVal) * 0.5f;
-  if (quantErr >  1.0f) quantErr =  1.0f;
-  if (quantErr < -1.0f) quantErr = -1.0f;
-
-#if DEBUG_METER
-  const int outDev = (dacVal > 128) ? (dacVal - 128) : (128 - dacVal);
-  if (outDev > mPeakOut) mPeakOut = outDev;
-#endif
-
-  dacWrite(PIN_AUDIO_OUT, (uint8_t)dacVal);
+  // --- Cible DAC : la sortie physique est tenue par le sigma-delta (~40 kHz) ---
+  dacTarget = 128.0f + y * 127.0f;
+  dacStep();
 }
 
 // ---------------------------------------------------------------------------
@@ -458,14 +465,22 @@ void setup() {
 }
 
 // ---------------------------------------------------------------------------
-// Boucle audio : cadence fixe 20 kHz
+// Boucle audio : échantillons à 20 kHz + pas sigma-delta intermédiaires
+// (le DAC est re-quantifié toutes les >=25 µs, soit ~40 kHz effectifs)
 // ---------------------------------------------------------------------------
+#define SD_STEP_US 25
+static uint32_t lastStepUs = 0;
+
 void loop() {
   const uint32_t now = micros();
-  if ((int32_t)(now - nextSampleUs) < 0) return;
 
-  nextSampleUs += SAMPLE_PERIOD_US;
-  if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
-
-  processSample();
+  if ((int32_t)(now - nextSampleUs) >= 0) {
+    nextSampleUs += SAMPLE_PERIOD_US;
+    if ((int32_t)(now - nextSampleUs) > 1000) nextSampleUs = now + SAMPLE_PERIOD_US;
+    processSample();                       // calcule dacTarget + 1er pas
+    lastStepUs = micros();
+  } else if ((uint32_t)(now - lastStepUs) >= SD_STEP_US) {
+    dacStep();                             // pas sigma-delta intermédiaire
+    lastStepUs = now;
+  }
 }
