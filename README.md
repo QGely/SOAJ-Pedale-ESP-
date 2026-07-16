@@ -25,6 +25,7 @@ Téléphone ──(WiFi + page web)──> ESP32 MAÎTRE ──(ESP-NOW)──> 
 |---|---|---|
 | `PedaleMaitre/` | ESP32 n°1 | Point d'accès WiFi + page web de réglage, diffuse en ESP-NOW |
 | `PedaleEsclave/` | ESP32 n°N | Reçoit les paramètres, traite l'audio guitare, sortie DAC |
+| `PedaleNam/` | **1 seul ESP32** | **Projet à part** : pédale autonome qui charge des captures TONE3000 (.nam) importées depuis le téléphone — voir la section dédiée en bas |
 
 Compiler avec l'Arduino IDE, carte **« ESP32 Dev Module »** (cartes ELEGOO ESP32 CP2102).
 Aucune bibliothèque externe : tout est inclus dans le core ESP32 (WiFi, WebServer,
@@ -328,3 +329,68 @@ maître récupère donc les réglages en moins d'une seconde). Les paquets sans 
 - Jamais de tension négative ni > 3,3 V sur GPIO34 (toujours passer par C1 + pont diviseur).
 - Ne pas déplacer l'entrée guitare sur un pin ADC2 : l'ADC2 ne fonctionne pas avec le WiFi.
 - Ne jamais envoyer d'audio par WiFi : uniquement les paramètres.
+
+---
+
+## PedaleNam — projet à part : 1 ESP32 + captures TONE3000 importées du téléphone
+
+`PedaleNam/` est une pédale **autonome et indépendante** du duo maître/esclave :
+un **seul ESP32** fait le point d'accès WiFi, la page web ET l'audio
+(mêmes câblages d'entrée/sortie que les autres pédales).
+
+```
+Téléphone ──(WiFi + page web)──> ESP32 unique ──> Ampli
+ │  http://192.168.4.1                 ▲
+ │                             Guitare (jack, ADC GPIO34)
+ └── fichier .nam téléchargé sur tone3000.com
+```
+
+### Le principe
+
+Un fichier `.nam` (Neural Amp Modeler, le format de tone3000.com) est un
+réseau de neurones : bien trop lourd pour tourner en temps réel sur un ESP32.
+L'astuce : **c'est le téléphone qui l'exécute**, pas l'ESP32.
+
+1. Sur le téléphone (avec Internet), télécharger une capture `.nam` de pédale
+   sur [tone3000.com](https://www.tone3000.com).
+2. Se connecter au WiFi **`SOAJ-NAM`** (mdp `soaj1234`), la page s'ouvre
+   (portail captif).
+3. **Importer le fichier .nam** : le JavaScript de la page exécute le réseau
+   (WaveNet et LSTM gérés, disposition des poids conforme à
+   NeuralAmpModelerCore), mesure sa courbe d'écrêtage (257 points, crêtes
+   positives et négatives séparées = asymétrie préservée) et sa réponse en
+   fréquence (sinus par paliers + Goertzel), puis n'envoie à l'ESP32 que ce
+   **profil** de ~2,5 Ko. L'analyse prend de quelques secondes à ~1 minute
+   selon le téléphone et la taille du modèle — une seule fois par capture.
+4. L'ESP32 grave le profil en flash (il **survit à l'extinction**) et le joue
+   en temps réel à 20 kHz : drive log → passe-haut → passe-bas → courbe
+   d'écrêtage interpolée → médiums → passe-bas de voicing → tone → volume,
+   avec le même gate, les mêmes anti-parasites et le même DAC sigma-delta
+   que les autres pédales du dépôt. Changement de profil **en fondu**, sans clic.
+
+### Réglages sur la page
+
+| Jauge | Rôle |
+|---|---|
+| Drive | pousse la courbe de la capture (course logarithmique) |
+| Intensité | 0 = clean pur (signal brut) → 1 = caractère complet de la capture |
+| Tone | passe-bas final, 0 = sombre → 1 = brillant |
+| Volume | niveau de sortie |
+
+API : `GET /api/get`, `GET /api/set?g=&d=&t=&v=&e=`,
+`POST /api/profil` (JSON du profil — c'est ce qu'envoie la page).
+
+### Limites honnêtes
+
+Le profil garde le **caractère statique** de la capture (courbe de saturation,
+asymétrie, équilibre spectral) mais pas sa **dynamique fine** (le réseau
+complet réagit à l'enveloppe du jeu). Ça marche très bien pour les pédales de
+saturation/disto/fuzz ; pour un ampli complet capturé avec son grain dynamique,
+la capture NAM d'origine sur un vrai moteur NAM (PC, Daisy Seed…) reste la
+référence. Sans surprise, la qualité est aussi bornée par les convertisseurs
+de l'ESP32 (ADC 12 bits, DAC 8 bits + sigma-delta).
+
+> Vérifié par simulation : croquis compilé hors carte et alimenté avec le
+> profil réellement produit par le moteur JavaScript sur les modèles d'exemple
+> officiels de NeuralAmpModelerCore (comptage des poids exact, WaveNet et
+> LSTM) — silence strict au repos, échange de profil sans saut, aucun NaN.
