@@ -1,3 +1,11 @@
+ > **⚠️ Piste remplacée** : la conception retenue est désormais le
+> « plug and play » par partage de connexion — voir
+> **CONCEPTION-PLUG-AND-PLAY.md**. Le hotspot du téléphone apporte les mêmes
+> bénéfices que le BLE (le téléphone garde Internet, plus de portail captif)
+> tout en donnant Internet à l'ESP32, qui télécharge et analyse lui-même les
+> captures via l'API officielle TONE3000. Ce document est conservé comme
+> trace de réflexion.
+
 # SOAJ NAM — Conception globale de la version BLUETOOTH
 
 > Schéma de pensée pour faire évoluer `PedaleNam` : le téléphone pilote la
